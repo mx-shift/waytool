@@ -1,6 +1,7 @@
 # systemd user unit for the waytool daemon. systemd/make-unit.sh
-# fills in @BIN@; gnome-extension/install.sh installs the result, and
-# the gnome-shell extension's Quick Settings toggle starts and stops it.
+# fills in @BIN@; gnome-extension/install.sh and the packages install
+# the result, and the gnome-shell extension's Quick Settings toggle
+# starts and stops it.
 #
 # Type=notify: the daemon reports READY only after the portal consent
 # dialog is accepted, so the unit sits in "activating" while the prompt

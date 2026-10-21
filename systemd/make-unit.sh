@@ -4,7 +4,7 @@
 #
 #     systemd/make-unit.sh /usr/bin/waytool > waytool.service
 #
-# Used by gnome-extension/install.sh.
+# Used by gnome-extension/install.sh and the packaging.
 
 set -eu
 

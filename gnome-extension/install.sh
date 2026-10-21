@@ -56,6 +56,9 @@ if ! systemctl --user daemon-reload; then
     echo "WARNING: couldn't reach your systemd user manager; run 'systemctl --user daemon-reload' from your desktop session." >&2
 fi
 echo "Installed $UNIT_DIR/waytool.service (off until toggled on in Quick Settings)"
+if [[ -f /usr/lib/systemd/user/waytool.service ]]; then
+    echo "NOTE: this overrides the packaged unit, so the toggle runs $BIN; delete $UNIT_DIR/waytool.service to go back to the package's." >&2
+fi
 
 if command -v gnome-extensions >/dev/null 2>&1; then
     if gnome-extensions enable "$UUID" 2>/dev/null; then
