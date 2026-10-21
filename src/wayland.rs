@@ -20,6 +20,10 @@ use anyhow::{Context, Result, anyhow};
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_registry, wl_seat, wl_shm};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+};
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
@@ -62,14 +66,18 @@ pub(crate) struct Globals {
     pub output_source: Option<ExtOutputImageCaptureSourceManagerV1>,
     pub screencopy: Option<ZwlrScreencopyManagerV1>,
     pub foreign_toplevel: Option<ZwlrForeignToplevelManagerV1>,
+    pub toplevel_list: Option<ExtForeignToplevelListV1>,
 }
 
-/// A window as wlr-foreign-toplevel-management reports it: no geometry,
-/// and no id of its own, so it gets one here.
+/// A window as wlr-foreign-toplevel-management or ext-foreign-toplevel-
+/// list reports it: no geometry, and no id of its own, so it gets one
+/// here.
 #[derive(Clone)]
 pub(crate) struct Toplevel {
     pub id: u64,
-    pub handle: ZwlrForeignToplevelHandleV1,
+    /// For activating it: wlr-foreign-toplevel-management only, as the
+    /// ext list just lists.
+    pub handle: Option<ZwlrForeignToplevelHandleV1>,
     pub title: String,
     pub app_id: String,
     /// Connector names of the outputs it's on.
@@ -89,6 +97,8 @@ struct Shared {
     keymap: Option<String>,
     /// Windows, where the compositor offers wlr-foreign-toplevel.
     toplevels: Vec<Toplevel>,
+    /// Windows from ext-foreign-toplevel-list, for compositors without it.
+    listed: Vec<Toplevel>,
     lost: bool,
 }
 
@@ -209,9 +219,15 @@ impl Wayland {
         (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
     }
 
-    /// The windows wlr-foreign-toplevel-management reports.
+    /// The windows wlr-foreign-toplevel-management reports, or failing
+    /// that ext-foreign-toplevel-list.
     pub(crate) fn toplevels(&self) -> Vec<Toplevel> {
-        self.shared.lock().unwrap().toplevels.clone()
+        let shared = self.shared.lock().unwrap();
+        if self.globals.foreign_toplevel.is_some() {
+            shared.toplevels.clone()
+        } else {
+            shared.listed.clone()
+        }
     }
 
     /// Whether the connection has been lost.
@@ -266,6 +282,9 @@ pub(crate) struct State {
     )>,
     next_toplevel: u64,
     toplevels_changed: bool,
+    /// ext-foreign-toplevel-list's windows by handle.
+    listed: Vec<(ExtForeignToplevelHandleV1, Toplevel)>,
+    listed_changed: bool,
     keymap_changed: Option<String>,
     changes: tokio::sync::watch::Sender<u64>,
     keymaps: tokio::sync::watch::Sender<u64>,
@@ -340,6 +359,10 @@ impl State {
                 })
                 .collect();
             self.shared.lock().unwrap().toplevels = toplevels;
+        }
+        if std::mem::take(&mut self.listed_changed) {
+            self.shared.lock().unwrap().listed =
+                self.listed.iter().map(|(_, t)| t.clone()).collect();
         }
         if let Some(keymap) = self.keymap_changed.take() {
             self.shared.lock().unwrap().keymap = Some(keymap);
@@ -418,6 +441,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     }
                     "zwlr_screencopy_manager_v1" => {
                         g.screencopy = Some(registry.bind(name, version.min(3), qh, ()))
+                    }
+                    "ext_foreign_toplevel_list_v1" => {
+                        g.toplevel_list = Some(registry.bind(name, 1, qh, ()))
                     }
                     "zwlr_foreign_toplevel_manager_v1" => {
                         g.foreign_toplevel = Some(registry.bind(name, version.min(3), qh, ()))
@@ -560,7 +586,7 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
             state.next_toplevel += 1;
             let entry = Toplevel {
                 id: state.next_toplevel,
-                handle: toplevel.clone(),
+                handle: Some(toplevel.clone()),
                 title: String::new(),
                 app_id: String::new(),
                 outputs: Vec::new(),
@@ -614,6 +640,64 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
             Event::Closed => {
                 state.toplevels.remove(i).0.destroy();
                 state.toplevels_changed = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtForeignToplevelListV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ExtForeignToplevelListV1,
+        event: ext_foreign_toplevel_list_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } = event {
+            state.next_toplevel += 1;
+            let entry = Toplevel {
+                id: state.next_toplevel,
+                handle: None,
+                title: String::new(),
+                app_id: String::new(),
+                outputs: Vec::new(),
+                maximized: false,
+                minimized: false,
+                activated: false,
+                fullscreen: false,
+            };
+            state.listed.push((toplevel, entry));
+        }
+    }
+
+    wayland_client::event_created_child!(State, ExtForeignToplevelListV1, [
+        ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE => (ExtForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        handle: &ExtForeignToplevelHandleV1,
+        event: ext_foreign_toplevel_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_foreign_toplevel_handle_v1::Event;
+        let Some(i) = state.listed.iter().position(|(h, _)| h == handle) else {
+            return;
+        };
+        let t = &mut state.listed[i].1;
+        match event {
+            Event::Title { title } => t.title = title,
+            Event::AppId { app_id } => t.app_id = app_id,
+            Event::Done => state.listed_changed = true,
+            Event::Closed => {
+                state.listed.remove(i).0.destroy();
+                state.listed_changed = true;
             }
             _ => {}
         }

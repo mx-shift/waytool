@@ -2,10 +2,10 @@
 //! names. Every desktop has its own way to do this, and no Wayland
 //! protocol gives a window's geometry, so there's a provider per desktop:
 //! the gnome-shell extension on GNOME, and the compositor's IPC socket on
-//! sway, niri and Hyprland. Elsewhere, wlr-foreign-toplevel-management
-//! lists windows, without geometry. Each reports a window as a dict with
-//! the same fields (see `windows` in the CLI help), leaving out what its
-//! desktop doesn't know.
+//! sway, niri and Hyprland. Elsewhere, wlr-foreign-toplevel-management or
+//! ext-foreign-toplevel-list lists windows, without geometry. Each
+//! reports a window as a dict with the same fields (see `windows` in the
+//! CLI help), leaving out what its desktop doesn't know.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,8 +29,8 @@ pub(crate) enum Windows {
     Niri(PathBuf),
     /// Hyprland's IPC socket.
     Hyprland(PathBuf),
-    /// wlr-foreign-toplevel-management: titles, app ids and states, but
-    /// no geometry.
+    /// wlr-foreign-toplevel-management (titles, app ids, states, focus) or
+    /// ext-foreign-toplevel-list (titles and app ids only): no geometry.
     Toplevels(Arc<Wayland>),
     /// No provider: why.
     Unavailable(String),
@@ -77,7 +77,8 @@ impl Windows {
         {
             return Windows::Gnome(bus.clone());
         }
-        if wayland.globals().foreign_toplevel.is_some() {
+        let g = wayland.globals();
+        if g.foreign_toplevel.is_some() || g.toplevel_list.is_some() {
             return Windows::Toplevels(wayland.clone());
         }
         Windows::Unavailable(
@@ -94,7 +95,10 @@ impl Windows {
             Windows::Sway(sock) => format!("sway ({})", sock.display()),
             Windows::Niri(sock) => format!("niri ({})", sock.display()),
             Windows::Hyprland(sock) => format!("Hyprland ({})", sock.display()),
-            Windows::Toplevels(_) => "wlr-foreign-toplevel-management".into(),
+            Windows::Toplevels(w) if w.globals().foreign_toplevel.is_some() => {
+                "wlr-foreign-toplevel-management".into()
+            }
+            Windows::Toplevels(_) => "ext-foreign-toplevel-list".into(),
             Windows::Unavailable(why) => format!("nowhere: {why}"),
         }
     }
@@ -148,7 +152,13 @@ impl Windows {
                     .seat
                     .as_ref()
                     .ok_or_else(|| anyhow!("the compositor has no seat"))?;
-                toplevel.handle.activate(seat);
+                let handle = toplevel.handle.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "this compositor offers no standard way to focus another window \
+                         (ext-foreign-toplevel-list only lists them)"
+                    )
+                })?;
+                handle.activate(seat);
                 wayland.flush()
             }
             Windows::Hyprland(sock) => {
