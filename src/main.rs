@@ -1,8 +1,9 @@
-//! waytool: command-line keyboard input on Wayland, through the
-//! freedesktop RemoteDesktop and ScreenCast portals.
+//! waytool: command-line keyboard input and screenshots
+//! on Wayland, through the freedesktop RemoteDesktop and ScreenCast
+//! portals.
 //!
 //! Architecture: one persistent daemon owns the session; every other
-//! subcommand (`key`, `type`, `streams`, ...) is a thin
+//! subcommand (`key`, `type`, `screenshot`, ...) is a thin
 //! client that connects to `$XDG_RUNTIME_DIR/waytool.sock` and
 //! makes one D-Bus call (see `protocol`).
 //!
@@ -10,21 +11,25 @@
 //! Each start shows the screen-sharing consent dialog — accept it.
 //! Commands reuse that session until the daemon exits.
 
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
+
+mod capture;
 mod daemon;
 mod eis;
 mod keys;
 mod portal;
 mod protocol;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Keyboard input on Wayland.",
-    long_about = "Keyboard input on Wayland.\n\
+    about = "Keyboard input and screenshots on Wayland.",
+    long_about = "Keyboard input and screenshots on Wayland.\n\
                   \n\
-                  Input goes through the RemoteDesktop and ScreenCast portals, \
+                  Input and screenshots go through the RemoteDesktop and ScreenCast portals, \
                   which need libei (GNOME 45+, KDE Plasma 6.1+, COSMIC); the daemon asks for \
                   screen-sharing consent when it starts.\n\
                   \n\
@@ -117,6 +122,17 @@ enum Cmd {
     },
 
     /* ----- capture ----- */
+    /// Capture one frame per stream (shared monitor), as PNG.
+    ///
+    /// With one stream it writes OUT; with several, OUT's name with `-N`
+    /// added per stream (shot.png → shot-0.png, shot-1.png). Prints
+    /// `wrote PATH` for each file.
+    Screenshot {
+        /// Where to write; should end in `.png` (the format follows the
+        /// extension).
+        out: PathBuf,
+    },
+
     /// List the capture streams: index, PipeWire node, position and size.
     ///
     /// These are the monitors shared in the consent dialog, each with its
@@ -126,7 +142,8 @@ enum Cmd {
 
     /// Print which stream covers a global logical point.
     ///
-    /// Useful for turning a global point into the stream that shows it.
+    /// Useful for turning a global point into the stream whose screenshot
+    /// shows it.
     StreamAt {
         /// Global logical x.
         x: f64,
@@ -161,6 +178,16 @@ async fn call(cmd: Cmd) -> Result<()> {
             .type_text(&text, delay.unwrap_or(0), hold.unwrap_or(0))
             .await
             .map_err(protocol::describe)?,
+        Cmd::Screenshot { out } => {
+            let frames = d.screenshot().await.map_err(protocol::describe)?;
+            let paths = screenshot_paths(&out, frames.len());
+            for (frame, path) in frames.into_iter().zip(paths) {
+                frame_to_image(frame)?
+                    .save(&path)
+                    .with_context(|| format!("save {}", path.display()))?;
+                println!("wrote {}", path.display());
+            }
+        }
         Cmd::Streams => {
             let streams = d.streams().await.map_err(protocol::describe)?;
             if streams.is_empty() {
@@ -186,4 +213,40 @@ async fn call(cmd: Cmd) -> Result<()> {
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())
+}
+
+/// Where `screenshot OUT` writes `n` frames: exactly `OUT` for one,
+/// `<stem>-N.<ext>` for several.
+fn screenshot_paths(out: &Path, n: usize) -> Vec<PathBuf> {
+    if n == 1 {
+        return vec![out.to_path_buf()];
+    }
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+    let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("png");
+    (0..n)
+        .map(|i| out.with_file_name(format!("{stem}-{i}.{ext}")))
+        .collect()
+}
+
+/// Read a frame's pixels out of the memfd the daemon passed.
+fn frame_to_image(frame: protocol::Frame) -> Result<image::RgbaImage> {
+    use std::os::unix::fs::FileExt;
+    let (w, h) = (frame.width, frame.height);
+    let len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| anyhow!("frame size {w}x{h} overflows"))?;
+    let file = std::fs::File::from(OwnedFd::from(frame.rgba));
+    // Check the claimed size against what the memfd holds before
+    // allocating for it.
+    let size = file.metadata().context("stat the frame memfd")?.len();
+    if size != len as u64 {
+        return Err(anyhow!(
+            "{w}x{h} frame should be {len} bytes, but the daemon sent {size}"
+        ));
+    }
+    let mut rgba = vec![0; len];
+    file.read_exact_at(&mut rgba, 0)
+        .with_context(|| format!("read {w}x{h} frame from the daemon"))?;
+    image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| anyhow!("bad {w}x{h} frame"))
 }

@@ -4,20 +4,25 @@
 //! ConnectToEIS (GNOME 45, Plasma 6.1, COSMIC 1.7), and GNOME reads
 //! Notify* pointer coordinates differently from the portal docs.
 
+use std::os::fd::OwnedFd;
+
 use anyhow::{Context, Result, anyhow};
 use ashpd::desktop::{
     PersistMode, Session,
     remote_desktop::{
         ConnectToEISOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
     },
-    screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+    screencast::{
+        CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
+    },
 };
 
 use crate::eis::Eis;
 
 /// One portal stream: its PipeWire node, and, when the source is a
 /// monitor, the monitor's rect in global logical coordinates (the
-/// compositor's layout).
+/// compositor's layout). A screenshot of it is the rect's size times
+/// the monitor's scale.
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
     pub node_id: u32,
@@ -43,9 +48,11 @@ impl StreamInfo {
 /// One established portal session: the RemoteDesktop + ScreenCast
 /// session, its libei connection, and the streams it started.
 pub(crate) struct Portal {
-    /// Held for as long as the session should last.
-    _session: Session<RemoteDesktop>,
+    pub(crate) session: Session<RemoteDesktop>,
     eis: Eis,
+    /// For OpenPipeWireRemote, which each capture calls for a PipeWire
+    /// connection of its own.
+    sc: Screencast,
     /// Each portal stream, in portal order.
     streams: Vec<StreamInfo>,
 }
@@ -54,7 +61,7 @@ impl Portal {
     /// Establish a fresh portal session and connect its input. May
     /// surface a consent dialog.
     pub(crate) async fn establish() -> Result<Portal> {
-        let (rd, session, streams) = establish_session().await?;
+        let (rd, sc, session, streams) = establish_session().await?;
         let eis = match connect_input(&rd, &session).await {
             Ok(eis) => eis,
             Err(e) => {
@@ -65,8 +72,9 @@ impl Portal {
             }
         };
         Ok(Portal {
-            _session: session,
+            session,
             eis,
+            sc,
             streams,
         })
     }
@@ -74,6 +82,11 @@ impl Portal {
     /// The session's streams.
     pub(crate) fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    /// A new PipeWire connection for one capture.
+    pub(crate) async fn pipewire_fd(&self) -> Result<OwnedFd> {
+        open_pipewire_remote(&self.sc, &self.session).await
     }
 
     /// Whether `keysym` is on the keyboard layout, so it can be typed as
@@ -111,7 +124,12 @@ async fn connect_input(rd: &RemoteDesktop, session: &Session<RemoteDesktop>) -> 
 }
 
 /// Establish the portal session. Surfaces the consent dialog.
-async fn establish_session() -> Result<(RemoteDesktop, Session<RemoteDesktop>, Vec<StreamInfo>)> {
+async fn establish_session() -> Result<(
+    RemoteDesktop,
+    Screencast,
+    Session<RemoteDesktop>,
+    Vec<StreamInfo>,
+)> {
     let rd = RemoteDesktop::new().await.context("RemoteDesktop proxy")?;
     let sc = Screencast::new().await.context("Screencast proxy")?;
 
@@ -120,7 +138,7 @@ async fn establish_session() -> Result<(RemoteDesktop, Session<RemoteDesktop>, V
         .await
         .context("portal CreateSession")?;
     match start_session(&rd, &sc, &session).await {
-        Ok(streams) => Ok((rd, session, streams)),
+        Ok(streams) => Ok((rd, sc, session, streams)),
         Err(e) => {
             // Don't leave a half-set-up session (or, past Start, a
             // started one) behind.
@@ -189,6 +207,18 @@ async fn start_session(
     }
 
     Ok(streams)
+}
+
+/// Open a PipeWire connection that sees the session's streams. The
+/// portal makes a new connection on every call; closing the fd ends it,
+/// and the server then destroys everything created over it.
+async fn open_pipewire_remote(
+    sc: &Screencast,
+    session: &Session<RemoteDesktop>,
+) -> Result<OwnedFd> {
+    sc.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default())
+        .await
+        .context("portal OpenPipeWireRemote")
 }
 
 #[cfg(test)]

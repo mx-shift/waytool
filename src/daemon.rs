@@ -5,7 +5,7 @@
 //!   portal session, connects its input through libei (`eis`), then
 //!   serves the D-Bus interface in `protocol` peer-to-peer on a unix
 //!   socket.
-//! - All other subcommands (`key`, `type`, `streams`, ...)
+//! - All other subcommands (`key`, `type`, `screenshot`, ...)
 //!   are thin clients that connect to the socket and make one call.
 //!
 //! Why a daemon: a portal session costs a consent dialog. The portal's
@@ -19,6 +19,7 @@
 //!   session until the daemon exits.
 //! - Nothing is kept on disk between runs.
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,16 +30,20 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::portal::Portal;
-use crate::protocol::{Error, StreamDesc};
+use crate::protocol::{Error, Frame, StreamDesc};
 
 /// State shared by every client connection.
 pub(crate) struct Daemon {
     /// The portal session.
     portal: Arc<Portal>,
     /// Serializes input requests, so one client's keystrokes never
-    /// interleave with another's. Read-only requests don't take it, so
-    /// a long `type` doesn't block them.
+    /// interleave with another's. Read-only requests and captures
+    /// don't take it, so a long `type` doesn't block them.
     input: Mutex<()>,
+    /// Serializes frame captures, so overlapping screenshots queue
+    /// instead of each standing up its own set of streams on the same
+    /// nodes.
+    capture: Mutex<()>,
 }
 
 impl Daemon {
@@ -182,6 +187,7 @@ pub async fn run_daemon() -> Result<()> {
     let daemon = Arc::new(Daemon {
         portal: portal.clone(),
         input: Mutex::new(()),
+        capture: Mutex::new(()),
     });
 
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -448,6 +454,49 @@ impl Service {
             .ok_or_else(|| anyhow!("no stream covers point ({x}, {y})"))?;
         Ok(idx as u32)
     }
+
+    /// Capture one frame per stream and hand each back as a memfd of
+    /// RGBA pixels. The client decides what to do with them; the daemon
+    /// never writes files on a caller's behalf.
+    async fn screenshot(&self) -> Result<Vec<Frame>, Error> {
+        let _call = self.admit()?;
+        let _capture = self.daemon.capture.lock().await;
+        let portal = self.daemon.portal();
+        let node_ids: Vec<u32> = portal.streams().iter().map(|s| s.node_id).collect();
+        let fd = portal.pipewire_fd().await?;
+        let frames = tokio::task::spawn_blocking(move || {
+            crate::capture::pipewire_capture_frames(fd, &node_ids)
+        })
+        .await
+        .context("screenshot blocking task")??;
+
+        let frames = frames
+            .into_iter()
+            .map(|f| {
+                Ok(Frame {
+                    width: f.width,
+                    height: f.height,
+                    rgba: memfd_with(&f.rgba)?.into(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(frames)
+    }
+}
+
+/// An anonymous in-memory file holding `data`, for passing bulk bytes
+/// to a client without touching the filesystem.
+pub(crate) fn memfd_with(data: &[u8]) -> Result<OwnedFd> {
+    use std::io::Write;
+    // SAFETY: memfd_create takes a NUL-terminated name and flags, and
+    // returns a new fd we immediately take ownership of.
+    let raw = unsafe { libc::memfd_create(c"waytool".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw < 0 {
+        return Err(anyhow!("memfd_create: {}", std::io::Error::last_os_error()));
+    }
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    file.write_all(data).context("fill memfd")?;
+    Ok(file.into())
 }
 
 /// Serve the interface `make_iface` builds (the daemon's `Service`) on

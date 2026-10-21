@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
@@ -67,6 +68,15 @@ pub struct StreamDesc {
     pub size: Option<(i32, i32)>,
 }
 
+/// One captured frame: `rgba` is a memfd holding `width * height * 4`
+/// bytes of tightly packed RGBA8, starting at offset 0.
+#[derive(Debug, Serialize, Deserialize, Type)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: zvariant::OwnedFd,
+}
+
 /// Client side of the daemon interface. The `default_service` is
 /// required by the proxy machinery but means nothing on a
 /// peer-to-peer connection; the daemon ignores the destination.
@@ -100,6 +110,8 @@ pub trait Daemon {
     fn streams(&self) -> Result<Vec<StreamDesc>, Error>;
     /// Index of the stream whose rect covers global point (x, y).
     fn stream_at(&self, x: f64, y: f64) -> Result<u32, Error>;
+    /// Capture one frame per stream, in stream index order.
+    fn screenshot(&self) -> Result<Vec<Frame>, Error>;
 }
 
 /// Connect to the running daemon.
@@ -169,6 +181,15 @@ mod tests {
                 size: None,
             }]
         }
+
+        async fn screenshot(&self) -> Result<Vec<Frame>, Error> {
+            let rgba = [1, 2, 3, 255, 4, 5, 6, 255];
+            Ok(vec![Frame {
+                width: 2,
+                height: 1,
+                rgba: crate::daemon::memfd_with(&rgba)?.into(),
+            }])
+        }
     }
 
     #[tokio::test]
@@ -190,6 +211,12 @@ mod tests {
         assert_eq!(streams[0].node_id, 42);
         assert_eq!(streams[0].position, Some((-1920, 0)));
         assert_eq!(streams[0].size, None);
+
+        let mut frames = d.screenshot().await.unwrap();
+        assert_eq!(frames.len(), 1);
+        let img = crate::frame_to_image(frames.remove(0)).unwrap();
+        assert_eq!(img.dimensions(), (2, 1));
+        assert_eq!(img.get_pixel(1, 0).0, [4, 5, 6, 255]);
 
         // The server side finishes once the client hangs up.
         drop(d);
