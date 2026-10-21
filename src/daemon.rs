@@ -140,8 +140,15 @@ impl Daemon {
     }
 
     /// Take the input lock and the portal to send input through.
+    /// Refused while the screen is locked: the compositor would hand the
+    /// keys and clicks to the unlock prompt.
     async fn input(&self) -> Result<(MutexGuard<'_, ()>, Arc<Portal>)> {
         self.check_ready()?;
+        if screen_locked().await {
+            return Err(anyhow!(
+                "the screen is locked; input is refused so nothing reaches the unlock prompt"
+            ));
+        }
         let guard = self.input.lock().await;
         Ok((guard, self.portal()))
     }
@@ -323,6 +330,55 @@ const MAX_CALLS_PER_CONNECTION: usize = 8;
 
 /// How long a client gets to finish the D-Bus handshake.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the user's graphical session is locked: logind's LockedHint
+/// on the user's display session, which GNOME's and KDE's screen lockers
+/// set. False when logind can't say (no logind, no graphical session, a
+/// locker that doesn't set the hint).
+async fn screen_locked() -> bool {
+    async fn locked() -> Result<bool> {
+        let bus = zbus::Connection::system().await?;
+        let dest = "org.freedesktop.login1";
+        let user: zvariant::OwnedObjectPath = bus
+            .call_method(
+                Some(dest),
+                "/org/freedesktop/login1",
+                Some("org.freedesktop.login1.Manager"),
+                "GetUser",
+                &(own_uid(),),
+            )
+            .await?
+            .body()
+            .deserialize()?;
+        let get = |path: zvariant::OwnedObjectPath, iface: &'static str, prop: &'static str| {
+            let bus = bus.clone();
+            async move {
+                let reply = bus
+                    .call_method(
+                        Some(dest),
+                        path.as_str(),
+                        Some("org.freedesktop.DBus.Properties"),
+                        "Get",
+                        &(iface, prop),
+                    )
+                    .await?;
+                let value: zvariant::OwnedValue = reply.body().deserialize()?;
+                Ok::<_, anyhow::Error>(value)
+            }
+        };
+        let (_id, display): (String, zvariant::OwnedObjectPath) =
+            get(user, "org.freedesktop.login1.User", "Display")
+                .await?
+                .try_into()?;
+        if display.as_str() == "/" {
+            return Ok(false);
+        }
+        Ok(bool::try_from(
+            get(display, "org.freedesktop.login1.Session", "LockedHint").await?,
+        )?)
+    }
+    locked().await.unwrap_or(false)
+}
 
 fn own_uid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
@@ -1182,6 +1238,14 @@ pub(crate) async fn serve_client<I: zbus::object_server::Interface>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live: what logind says about this session's lock.
+    /// `cargo test -- --ignored screen_locked_live --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn screen_locked_live() {
+        println!("locked: {}", screen_locked().await);
+    }
 
     struct Nothing;
 
