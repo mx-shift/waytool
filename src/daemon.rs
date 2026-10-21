@@ -25,7 +25,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::portal::Portal;
 use crate::protocol::Error;
@@ -154,14 +154,12 @@ async fn accept_client(
     if uid != own_uid() {
         return Err(anyhow!("refused a connection from uid {uid}"));
     }
-    serve_client(
-        stream,
-        Service {
-            daemon,
-            _connection: connection,
-            calls: Arc::new(Semaphore::new(MAX_CALLS_PER_CONNECTION)),
-        },
-    )
+    serve_client(stream, |hangup| Service {
+        daemon,
+        hangup,
+        _connection: connection,
+        calls: Arc::new(Semaphore::new(MAX_CALLS_PER_CONNECTION)),
+    })
     .await
 }
 
@@ -219,13 +217,55 @@ fn keysym(name: &str) -> Result<u32> {
         .ok_or_else(|| anyhow!("unknown key name {name:?} (see `waytool key --help`)"))
 }
 
+/// Longest `delay`/`hold` a type request may ask for, in milliseconds.
+const MAX_PACING_MS: u32 = 10_000;
+
+/// Fires when the client that made a request hangs up — Ctrl-C on the
+/// CLI, say — so long-running requests can stop instead of carrying on
+/// for nobody.
+#[derive(Clone)]
+pub(crate) struct Hangup(watch::Receiver<bool>);
+
+impl Hangup {
+    fn happened(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Sleep for `ms` milliseconds, or until the client hangs up.
+    async fn sleep(&mut self, ms: u32) {
+        if ms > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(ms.into())) => {}
+                _ = self.0.wait_for(|gone| *gone) => {}
+            }
+        }
+    }
+}
+
 /// Type `text` into whatever currently holds keyboard focus, one
-/// press+release per character.
+/// press+release per character. `delay_ms` is how long to wait after
+/// each character — pacing for slow consumers (e.g. DOSBox's emulated
+/// keyboard, which drops characters typed faster than it can drain).
+/// `hold_ms` is how long each key stays down, for emulators that scan a
+/// keyboard matrix (VICE) and miss a key pressed and released between
+/// two scans. Stops between characters if the client hangs up; a key
+/// that's down is always released first.
 ///
 /// A character that isn't on the keyboard layout can't be sent as a key
 /// press at all, so it's refused. Everything is checked before the
 /// first keystroke, so a string that can't be typed types nothing.
-async fn type_text(portal: &Portal, text: &str) -> Result<()> {
+async fn type_text(
+    portal: &Portal,
+    text: &str,
+    delay_ms: u32,
+    hold_ms: u32,
+    mut hangup: Hangup,
+) -> Result<()> {
+    for (name, ms) in [("delay", delay_ms), ("hold", hold_ms)] {
+        if ms > MAX_PACING_MS {
+            return Err(anyhow!("--{name} is at most {MAX_PACING_MS} ms, got {ms}"));
+        }
+    }
     let mut syms = Vec::new();
     for ch in text.chars() {
         let sym = crate::keys::keysym_for_char(ch)
@@ -238,7 +278,13 @@ async fn type_text(portal: &Portal, text: &str) -> Result<()> {
         syms.push(sym);
     }
     for sym in syms {
-        portal.tap_keysym(sym)?;
+        if hangup.happened() {
+            return Err(anyhow!("client hung up; stopped typing"));
+        }
+        portal.keysym(sym, true)?;
+        hangup.sleep(hold_ms).await;
+        portal.keysym(sym, false)?;
+        hangup.sleep(delay_ms).await;
     }
     Ok(())
 }
@@ -276,6 +322,7 @@ async fn key_chord(portal: &Portal, syms: &[u32]) -> Result<()> {
 /// connection can start.
 struct Service {
     daemon: Arc<Daemon>,
+    hangup: Hangup,
     _connection: OwnedSemaphorePermit,
     calls: Arc<Semaphore>,
 }
@@ -349,24 +396,27 @@ impl Service {
         Ok(())
     }
 
-    async fn type_text(&self, text: String) -> Result<(), Error> {
+    async fn type_text(&self, text: String, delay_ms: u32, hold_ms: u32) -> Result<(), Error> {
         let _call = self.admit()?;
         let (_input, portal) = self.daemon.input().await?;
-        type_text(&portal, &text).await?;
+        let hangup = self.hangup.clone();
+        type_text(&portal, &text, delay_ms, hold_ms, hangup).await?;
         Ok(())
     }
 }
 
-/// Serve `iface` (the daemon's `Service`) on one client connection
-/// until the client hangs up.
+/// Serve the interface `make_iface` builds (the daemon's `Service`) on
+/// one client connection until the client hangs up, then fire the
+/// `Hangup` it was given.
 pub(crate) async fn serve_client<I: zbus::object_server::Interface>(
     stream: UnixStream,
-    iface: I,
+    make_iface: impl FnOnce(Hangup) -> I,
 ) -> Result<()> {
+    let (hung_up, hangup) = watch::channel(false);
     let handshake = zbus::connection::Builder::unix_stream(stream)
         .server(zbus::Guid::generate())?
         .p2p()
-        .serve_at(crate::protocol::OBJECT_PATH, iface)?
+        .serve_at(crate::protocol::OBJECT_PATH, make_iface(Hangup(hangup)))?
         .build();
     let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
@@ -375,12 +425,18 @@ pub(crate) async fn serve_client<I: zbus::object_server::Interface>(
     // The connection's message stream ends when its socket closes.
     let mut messages = zbus::MessageStream::from(&conn);
     while messages.next().await.is_some() {}
+    let _ = hung_up.send(true);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Nothing;
+
+    #[zbus::interface(name = "com.mxshift.Waytool.Test")]
+    impl Nothing {}
 
     #[tokio::test]
     async fn socket_file_binds_once_and_cleans_up() {
@@ -403,5 +459,34 @@ mod tests {
         drop(file);
         assert!(!sock.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hangup_fires_when_the_client_disconnects() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(serve_client(server, |hangup| {
+            tx.send(hangup).ok().unwrap();
+            Nothing
+        }));
+        let conn = zbus::connection::Builder::unix_stream(client)
+            .p2p()
+            .build()
+            .await
+            .unwrap();
+        let mut hangup = rx.await.unwrap();
+        assert!(!hangup.happened());
+
+        drop(conn);
+        tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(hangup.happened());
+        // And a pending sleep returns at once rather than running out.
+        tokio::time::timeout(std::time::Duration::from_secs(1), hangup.sleep(60_000))
+            .await
+            .unwrap();
     }
 }

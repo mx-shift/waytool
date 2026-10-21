@@ -81,7 +81,9 @@ pub trait Daemon {
     /// Release a keysym held with KeyDown.
     fn key_up(&self, name: &str) -> Result<(), Error>;
     /// Type a UTF-8 string, one press+release per character.
-    fn type_text(&self, text: &str) -> Result<(), Error>;
+    /// `delay_ms` waits after each character and `hold_ms` keeps each
+    /// key down; 0 means no wait.
+    fn type_text(&self, text: &str, delay_ms: u32, hold_ms: u32) -> Result<(), Error>;
 }
 
 /// Connect to the running daemon.
@@ -148,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn round_trip_over_socket_pair() {
         let (server, client) = UnixStream::pair().unwrap();
-        let served = tokio::spawn(crate::daemon::serve_client(server, Stub));
+        let served = tokio::spawn(crate::daemon::serve_client(server, |_| Stub));
         let d = connect_stream(client).await.unwrap();
 
         d.ping().await.unwrap();

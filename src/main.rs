@@ -103,6 +103,16 @@ enum Cmd {
     Type {
         /// The text to type.
         text: String,
+        /// Milliseconds to wait after each character (at most 10000);
+        /// omit for full speed. About 25 suits DOSBox, whose emulated
+        /// keyboard drops characters typed too fast.
+        #[arg(long)]
+        delay: Option<u32>,
+        /// Milliseconds each key stays down (at most 10000); omit to release
+        /// it at once. For emulators that scan a keyboard matrix (VICE) and
+        /// miss a key pressed and released between two scans.
+        #[arg(long)]
+        hold: Option<u32>,
     },
 }
 
@@ -128,7 +138,10 @@ async fn call(cmd: Cmd) -> Result<()> {
         Cmd::KeyCode { code } => d.key_code(code).await.map_err(protocol::describe)?,
         Cmd::KeyDown { name } => d.key_down(&name).await.map_err(protocol::describe)?,
         Cmd::KeyUp { name } => d.key_up(&name).await.map_err(protocol::describe)?,
-        Cmd::Type { text } => d.type_text(&text).await.map_err(protocol::describe)?,
+        Cmd::Type { text, delay, hold } => d
+            .type_text(&text, delay.unwrap_or(0), hold.unwrap_or(0))
+            .await
+            .map_err(protocol::describe)?,
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())
