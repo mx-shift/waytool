@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=waytool tray
+Comment=Switch the waytool daemon on and off from the system tray
+Exec=waytool tray
+Icon=preferences-desktop-remote-desktop
+NoDisplay=true
+# GNOME has the extension's Quick Settings toggle instead.
+NotShowIn=GNOME;

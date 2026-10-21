@@ -60,6 +60,7 @@ assets = [
     ["gnome-extension/extension.js", "usr/share/gnome-shell/extensions/waytool@mxshift.com/", "644"],
     ["gnome-extension/service.js", "usr/share/gnome-shell/extensions/waytool@mxshift.com/", "644"],
     ["kwin/waytool.js", "usr/share/waytool/kwin/", "644"],
+    ["autostart/waytool-tray.desktop", "etc/xdg/autostart/", "644"],
     ["README.md", "usr/share/doc/waytool/", "644"],
 ]
 
@@ -71,6 +72,7 @@ assets = [
     { source = "gnome-extension/extension.js", dest = "/usr/share/gnome-shell/extensions/waytool@mxshift.com/extension.js", mode = "644" },
     { source = "gnome-extension/service.js", dest = "/usr/share/gnome-shell/extensions/waytool@mxshift.com/service.js", mode = "644" },
     { source = "kwin/waytool.js", dest = "/usr/share/waytool/kwin/waytool.js", mode = "644" },
+    { source = "autostart/waytool-tray.desktop", dest = "/etc/xdg/autostart/waytool-tray.desktop", mode = "644", config = true },
     { source = "README.md", dest = "/usr/share/doc/waytool/README.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/waytool/LICENSE", mode = "644", doc = true },
 ]

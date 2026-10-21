@@ -29,6 +29,7 @@ mod keys;
 mod kwin;
 mod portal;
 mod protocol;
+mod tray;
 mod wayland;
 mod windows;
 mod wlr_capture;
@@ -73,6 +74,15 @@ enum Cmd {
     /// the daemon exits. Stop it with Ctrl-C, or from the desktop's
     /// screen-sharing indicator.
     Daemon,
+
+    /// Show a system-tray icon that switches the daemon on and off.
+    ///
+    /// For desktops without the GNOME extension's Quick Settings toggle:
+    /// a StatusNotifierItem, shown by KDE Plasma's system tray, COSMIC's
+    /// panel, and bars like waybar. Clicking it starts or stops the
+    /// daemon's systemd user unit (waytool.service); its tooltip says
+    /// which state the daemon is in. The packages start it at login.
+    Tray,
 
     /// Check that the daemon is up; prints `pong`.
     Ping,
@@ -410,6 +420,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon => daemon::run_daemon().await,
+        Cmd::Tray => tray::run_tray().await,
         cmd => call(cmd).await,
     }
 }
@@ -582,7 +593,7 @@ async fn call(cmd: Cmd) -> Result<()> {
                 println!("... walk truncated — matches beyond the budget were not seen");
             }
         }
-        Cmd::Daemon => unreachable!("the daemon is not a client command"),
+        Cmd::Daemon | Cmd::Tray => unreachable!("not a client command"),
     }
     Ok(())
 }
