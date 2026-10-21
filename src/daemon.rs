@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, wa
 
 use crate::portal::Portal;
 use crate::protocol::{Error, Frame, StreamDesc, WindowDict};
-use crate::windows::{Windows, summarize_windows, window_matches};
+use crate::windows::{Windows, dict_i64, summarize_windows, window_matches};
 
 /// Tell systemd about our state when run as a `Type=notify` unit
 /// (`READY=1`, `STATUS=...`). A no-op outside systemd. Readiness is
@@ -904,11 +904,79 @@ impl Service {
             _ if all => Ok(matches),
             n => Err(anyhow!(
                 "{n} windows match {pattern:?} — refine the pattern, target one \
-                 by id (`window <id>`), or pass --all to list every match:\n{}",
+                 by id (`window <id>` / `click-in <id> ...`), or pass --all to \
+                 list every match:\n{}",
                 summarize_windows(&matches)
             )
             .into()),
         }
+    }
+
+    /// Focus a window, move to coordinates relative to its origin, and
+    /// click — the one-shot "drive this window" primitive. `window` is a
+    /// numeric id or a find-window pattern that must match exactly one
+    /// window. `x`/`y` are global-logical units measured from the
+    /// window's frame origin (or client origin when `client` is set).
+    /// Returns the window id and the global point clicked.
+    async fn click_in(
+        &self,
+        window: String,
+        x: f64,
+        y: f64,
+        button: String,
+        client: bool,
+    ) -> Result<(u64, f64, f64), Error> {
+        let _call = self.admit()?;
+        finite(&[x, y])?;
+        let code = crate::keys::button_code(&button)?;
+        // The input lock is taken before focusing, so another client's
+        // focus can't land between this focus and this click.
+        let (_input, portal) = self.daemon.input().await?;
+        let win = self.daemon.windows.resolve_and_focus(&window).await?;
+        let id = dict_i64(&win, "id")?;
+
+        let (prefix, label) = if client {
+            ("client", "client area")
+        } else {
+            ("frame", "frame")
+        };
+        let ox = dict_i64(&win, &format!("{prefix}_x"))? as f64;
+        let oy = dict_i64(&win, &format!("{prefix}_y"))? as f64;
+        let w = dict_i64(&win, &format!("{prefix}_w"))? as f64;
+        let h = dict_i64(&win, &format!("{prefix}_h"))? as f64;
+        if x < 0.0 || y < 0.0 || x >= w || y >= h {
+            return Err(anyhow!(
+                "offset ({x:.0}, {y:.0}) is outside window {id}'s {label} \
+                 ({w:.0}x{h:.0}). click-in coordinates are RELATIVE to the \
+                 window's origin, not global screen coordinates."
+            )
+            .into());
+        }
+        let (gx, gy) = (ox + x, oy + y);
+        portal.move_to_global(gx, gy)?;
+        portal.click(code)?;
+        Ok((id as u64, gx, gy))
+    }
+
+    /// Focus a window, then type into it — same window resolution and
+    /// focus-wait as ClickIn, same typing semantics as TypeText. No
+    /// pointer movement: keyboard input follows focus. Returns the
+    /// window id.
+    async fn type_in(
+        &self,
+        window: String,
+        text: String,
+        delay_ms: u32,
+        hold_ms: u32,
+    ) -> Result<u64, Error> {
+        let _call = self.admit()?;
+        // As in click_in, the input lock covers the focus too.
+        let (_input, portal) = self.daemon.input().await?;
+        let win = self.daemon.windows.resolve_and_focus(&window).await?;
+        let id = dict_i64(&win, "id")?;
+        let hangup = self.hangup.clone();
+        type_text(&portal, &text, delay_ms, hold_ms, hangup).await?;
+        Ok(id as u64)
     }
 }
 

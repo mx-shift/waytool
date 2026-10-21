@@ -299,6 +299,51 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+
+    /// [windows] Focus a window and click at a point relative to it.
+    ///
+    /// X and Y are measured from the window's frame (its visible top-left
+    /// corner) in global logical units, the units `windows` uses: divide
+    /// screenshot pixels by the monitor's scale. Points outside the window
+    /// are rejected, and so is a window that doesn't take focus (a modal
+    /// dialog has it, say); the error names the window that has it. A
+    /// following `key` or `type` goes to the same window.
+    ClickIn {
+        /// Window id, or a pattern matching one window's wm_class, app_id
+        /// or title.
+        window: String,
+        /// Offset from the window's left edge.
+        x: f64,
+        /// Offset from the window's top edge.
+        y: f64,
+        /// left, right, middle, back or forward.
+        #[arg(long, default_value = "left")]
+        button: String,
+        /// Measure X and Y from the client area (without decorations)
+        /// instead of the frame.
+        #[arg(long)]
+        client: bool,
+    },
+
+    /// [windows] Focus a window and type a UTF-8 string into it.
+    ///
+    /// WINDOW resolves as for `click-in`, and typing works as for `type`.
+    /// Fails, typing nothing, if the window doesn't take focus.
+    TypeIn {
+        /// Window id, or a pattern matching one window's wm_class, app_id
+        /// or title.
+        window: String,
+        /// The text to type.
+        text: String,
+        /// Milliseconds to wait after each character (at most 10000);
+        /// omit for full speed. About 25 suits DOSBox.
+        #[arg(long)]
+        delay: Option<u32>,
+        /// Milliseconds each key stays down (at most 10000); omit to release
+        /// it at once.
+        #[arg(long)]
+        hold: Option<u32>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -397,6 +442,36 @@ async fn call(cmd: Cmd) -> Result<()> {
                 .await
                 .map_err(protocol::describe)?;
             println!("{}", fmt_dicts("match", &matches));
+        }
+        Cmd::ClickIn {
+            window,
+            x,
+            y,
+            button,
+            client,
+        } => {
+            let (id, gx, gy) = d
+                .click_in(&window, x, y, &button, client)
+                .await
+                .map_err(protocol::describe)?;
+            let label = if client { "client area" } else { "frame" };
+            println!(
+                "clicked {button} at ({x:.0}, {y:.0}) relative to window {id}'s {label} \
+                 (global {gx:.0}, {gy:.0})"
+            );
+        }
+        Cmd::TypeIn {
+            window,
+            text,
+            delay,
+            hold,
+        } => {
+            let id = d
+                .type_in(&window, &text, delay.unwrap_or(0), hold.unwrap_or(0))
+                .await
+                .map_err(protocol::describe)?;
+            let nchars = text.chars().count();
+            println!("typed {nchars} character(s) into window {id}");
         }
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }

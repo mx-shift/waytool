@@ -176,6 +176,20 @@ pub trait Daemon {
     /// Windows whose wm_class/app_id/title contains `pattern`. Errors
     /// unless exactly one matches, or `all` is set.
     fn find_window(&self, pattern: &str, all: bool) -> Result<Vec<WindowDict>, Error>;
+    /// Focus a window (an id or a pattern matching one window), then
+    /// click at (x, y) relative to its frame, or its client area when
+    /// `client` is set. Returns the window id and the global point.
+    fn click_in(
+        &self,
+        window: &str,
+        x: f64,
+        y: f64,
+        button: &str,
+        client: bool,
+    ) -> Result<(u64, f64, f64), Error>;
+    /// Focus a window, then type into it like TypeText. Returns the
+    /// window id.
+    fn type_in(&self, window: &str, text: &str, delay_ms: u32, hold_ms: u32) -> Result<u64, Error>;
 }
 
 /// Connect to the running daemon.
