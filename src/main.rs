@@ -8,7 +8,7 @@
 //! client that connects to `$XDG_RUNTIME_DIR/waytool.sock` and
 //! makes one D-Bus call (see `protocol`).
 //!
-//! Run `waytool daemon` in a terminal.
+//! Run `waytool daemon` (in a terminal or as a systemd user unit).
 //! Each start shows the screen-sharing consent dialog — accept it.
 //! Commands reuse that session until the daemon exits.
 

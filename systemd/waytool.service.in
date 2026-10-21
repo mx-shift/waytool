@@ -1,0 +1,37 @@
+# systemd user unit for the waytool daemon. systemd/make-unit.sh
+# fills in @BIN@; gnome-extension/install.sh installs the result, and
+# the gnome-shell extension's Quick Settings toggle starts and stops it.
+#
+# Type=notify: the daemon reports READY only after the portal consent
+# dialog is accepted, so the unit sits in "activating" while the prompt
+# is up. No Restart=: the daemon exits when the user stops the screen
+# capture or declines consent, and restarting would just re-prompt.
+#
+# No [Install] section: the daemon is off by default and only runs
+# while switched on from the Quick Settings toggle.
+#
+# Sandboxing: the daemon's power is the portal session it holds, not
+# anything on disk, so this is defense in depth. It needs the session
+# bus, PipeWire and its socket — all AF_UNIX — and writes nothing but
+# that socket. ProtectHome= and PrivateTmp= are left out: they'd hide
+# the user's files from nothing the daemon touches, and depend on user
+# namespaces some systems don't allow.
+
+[Unit]
+Description=waytool input/screenshot daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=notify
+ExecStart="@BIN@" daemon
+TimeoutStartSec=infinity
+NoNewPrivileges=yes
+UMask=0077
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native

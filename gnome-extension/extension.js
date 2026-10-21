@@ -69,12 +69,24 @@
 //
 // All ids are Meta.Window.get_id() — a stable uint64 valid for the
 // window's lifetime.
+//
+// Quick Settings toggle:
+//
+//   Adds a "Waytool" toggle to the top-right Quick Settings menu
+//   that starts/stops the daemon's systemd user unit
+//   (waytool.service, see service.js).  Its subtitle tracks the
+//   unit: On / Waiting for consent / Stopping / Off / Failed / Not
+//   installed.
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {QuickToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
+
+import {AgentService} from './service.js';
 
 Gio._promisify(Gio.DBusConnection.prototype, 'call_with_unix_fd_list');
 
@@ -248,6 +260,55 @@ function findWindowById(id) {
     return null;
 }
 
+/* ---------- Quick Settings toggle ---------- */
+
+const SUBTITLES = {
+    missing:  'Not installed',
+    off:      'Off',
+    failed:   'Failed',
+    starting: 'Waiting for consent',
+    on:       'On',
+    stopping: 'Stopping',
+};
+
+const AgentToggle = GObject.registerClass(
+class AgentToggle extends QuickToggle {
+    constructor(service) {
+        super({
+            title: 'Waytool',
+            iconName: 'preferences-desktop-remote-desktop-symbolic',
+        });
+        this._service = service;
+        this._stateId = service.connect('notify::state', () => this._sync());
+        this.connect('clicked', () => {
+            const op = this._service.active ? this._service.stop() : this._service.start();
+            op.catch(e => console.warn(`waytool: toggle failed: ${e.message}`));
+        });
+        this.connect('destroy', () => service.disconnect(this._stateId));
+        this._sync();
+    }
+
+    _sync() {
+        const state = this._service.state;
+        this.checked = this._service.active;
+        this.subtitle = SUBTITLES[state];
+        this.reactive = state !== 'missing' && state !== 'stopping';
+    }
+});
+
+const AgentIndicator = GObject.registerClass(
+class AgentIndicator extends SystemIndicator {
+    constructor(service) {
+        super();
+        this.quickSettingsItems.push(new AgentToggle(service));
+    }
+
+    destroy() {
+        this.quickSettingsItems.forEach(item => item.destroy());
+        super.destroy();
+    }
+});
+
 /* ---------- D-Bus interface ---------- */
 
 // A D-Bus error with a proper name, rather than the unmapped-GError
@@ -368,11 +429,18 @@ class AgentDBus {
 
 export default class WaytoolExtension extends Extension {
     enable() {
+        this._service = new AgentService();
+        this._indicator = new AgentIndicator(this._service);
+        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
         this._dbus = new AgentDBus();
     }
 
     disable() {
         this._dbus?.destroy();
         this._dbus = null;
+        this._indicator?.destroy();
+        this._indicator = null;
+        this._service?.destroy();
+        this._service = null;
     }
 }
