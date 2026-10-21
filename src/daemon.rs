@@ -1128,6 +1128,14 @@ impl Service {
         } else {
             ("frame", "frame")
         };
+        if !win.contains_key(&format!("{prefix}_x")) {
+            return Err(anyhow!(
+                "this desktop doesn't say where window {id} is (niri, for one, reports \
+                 positions only for floating windows), so click-in can't place the click; \
+                 use click-at on a screenshot instead"
+            )
+            .into());
+        }
         let ox = dict_i64(&win, &format!("{prefix}_x"))? as f64;
         let oy = dict_i64(&win, &format!("{prefix}_y"))? as f64;
         let w = dict_i64(&win, &format!("{prefix}_w"))? as f64;

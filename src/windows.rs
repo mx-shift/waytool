@@ -1,9 +1,9 @@
 //! Windows: listing them, focusing one, and finding the one a selector
 //! names. Every desktop has its own way to do this, and no Wayland
 //! protocol gives a window's geometry, so there's a provider per desktop:
-//! the gnome-shell extension on GNOME, and the compositor's IPC socket
-//! on sway. Each reports a window as a dict with the same fields (see
-//! `windows` in the CLI help), leaving out what its desktop doesn't
+//! the gnome-shell extension on GNOME, and the compositor's IPC socket on
+//! sway and niri. Each reports a window as a dict with the same fields
+//! (see `windows` in the CLI help), leaving out what its desktop doesn't
 //! know.
 
 use std::path::{Path, PathBuf};
@@ -24,6 +24,8 @@ pub(crate) enum Windows {
     Gnome(zbus::Connection),
     /// sway's IPC socket.
     Sway(PathBuf),
+    /// niri's IPC socket.
+    Niri(PathBuf),
     /// No provider: why.
     Unavailable(String),
 }
@@ -37,14 +39,22 @@ impl Windows {
         if let Some(sock) = env_socket("SWAYSOCK") {
             return Windows::Sway(sock);
         }
+        if let Some(sock) = env_socket("NIRI_SOCKET") {
+            return Windows::Niri(sock);
+        }
         // Otherwise (a systemd unit the variables didn't reach), the IPC
-        // socket our compositor made: sway names its with its pid.
-        if let Some(pid) = compositor
-            && let Some(sock) = runtime_socket(|n| {
+        // socket our compositor made: both name theirs with their pid.
+        if let Some(pid) = compositor {
+            if let Some(sock) = runtime_socket(|n| {
                 n.starts_with("sway-ipc.") && n.ends_with(&format!(".{pid}.sock"))
-            })
-        {
-            return Windows::Sway(sock);
+            }) {
+                return Windows::Sway(sock);
+            }
+            if let Some(sock) =
+                runtime_socket(|n| n.starts_with("niri.") && n.ends_with(&format!(".{pid}.sock")))
+            {
+                return Windows::Niri(sock);
+            }
         }
         // gnome-shell, if it's the compositor (not just on the bus, as it
         // is for a compositor nested inside GNOME).
@@ -55,7 +65,7 @@ impl Windows {
         }
         Windows::Unavailable(
             "this desktop has no window provider (GNOME with the waytool extension, \
-             or sway)"
+             sway, or niri)"
                 .into(),
         )
     }
@@ -65,6 +75,7 @@ impl Windows {
         match self {
             Windows::Gnome(_) => "the gnome-shell extension".into(),
             Windows::Sway(sock) => format!("sway ({})", sock.display()),
+            Windows::Niri(sock) => format!("niri ({})", sock.display()),
             Windows::Unavailable(why) => format!("nowhere: {why}"),
         }
     }
@@ -74,6 +85,7 @@ impl Windows {
         match self {
             Windows::Gnome(bus) => ext_call(&ext_proxy(bus).await?, "GetWindows", &()).await,
             Windows::Sway(sock) => sway_windows(sock).await,
+            Windows::Niri(sock) => niri_windows(sock).await,
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
     }
@@ -98,6 +110,10 @@ impl Windows {
         match self {
             Windows::Gnome(bus) => ext_call(&ext_proxy(bus).await?, "FocusWindow", &(id,)).await,
             Windows::Sway(sock) => sway_command(sock, &format!("[con_id={id}] focus")).await,
+            Windows::Niri(sock) => {
+                let request = serde_json::json!({"Action": {"FocusWindow": {"id": id}}});
+                niri_request(sock, &request).await.map(|_| ())
+            }
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
     }
@@ -300,6 +316,103 @@ fn sway_window(
             n["visible"].as_bool().unwrap_or(false).into(),
         ),
     ])
+}
+
+/* ----- niri ----- */
+
+/// One niri IPC request (niri-ipc: a JSON line each way), returning the
+/// reply's `Ok` value.
+async fn niri_request(sock: &Path, request: &serde_json::Value) -> Result<serde_json::Value> {
+    let stream = UnixStream::connect(sock)
+        .await
+        .with_context(|| format!("connect to niri at {}", sock.display()))?;
+    let (read, mut write) = stream.into_split();
+    let mut line = request.to_string();
+    line.push('\n');
+    write
+        .write_all(line.as_bytes())
+        .await
+        .context("niri IPC write")?;
+    let mut reply = String::new();
+    tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(read), &mut reply)
+        .await
+        .context("niri IPC read")?;
+    let mut reply: serde_json::Value = serde_json::from_str(&reply).context("niri IPC reply")?;
+    match reply.get_mut("Ok") {
+        Some(ok) => Ok(ok.take()),
+        None => Err(anyhow!(
+            "niri: {}",
+            reply["Err"].as_str().unwrap_or("request failed")
+        )),
+    }
+}
+
+async fn niri_windows(sock: &Path) -> Result<Vec<WindowDict>> {
+    let request = |name: &str| serde_json::Value::String(name.into());
+    let windows = niri_request(sock, &request("Windows")).await?;
+    let workspaces = niri_request(sock, &request("Workspaces")).await?;
+    let outputs = niri_request(sock, &request("Outputs")).await?;
+    let workspace = |id: &serde_json::Value| {
+        workspaces["Workspaces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| &w["id"] == id)
+    };
+    windows["Windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|w| {
+            let ws = workspace(&w["workspace_id"]);
+            let output = ws.and_then(|ws| ws["output"].as_str()).unwrap_or("");
+            let mut fields = vec![
+                ("id", Value::U64(w["id"].as_u64().unwrap_or(0))),
+                ("title", w["title"].as_str().unwrap_or("").into()),
+                ("app_id", w["app_id"].as_str().unwrap_or("").into()),
+                ("wm_class", w["app_id"].as_str().unwrap_or("").into()),
+                ("pid", Value::I32(w["pid"].as_i64().unwrap_or(0) as i32)),
+                ("monitor", output.into()),
+                ("focused", w["is_focused"].as_bool().unwrap_or(false).into()),
+                (
+                    "workspace",
+                    Value::I32(ws.and_then(|ws| ws["idx"].as_i64()).unwrap_or(0) as i32),
+                ),
+                (
+                    "on_active_workspace",
+                    ws.and_then(|ws| ws["is_active"].as_bool())
+                        .unwrap_or(false)
+                        .into(),
+                ),
+            ];
+            // niri gives a position only for floating windows: the
+            // tile's place in the workspace view, which sits at its
+            // output's logical origin.
+            let layout = &w["layout"];
+            let origin = &outputs["Outputs"][output]["logical"];
+            if let (Some(tile), Some(offset), Some(size)) = (
+                layout["tile_pos_in_workspace_view"].as_array(),
+                layout["window_offset_in_tile"].as_array(),
+                layout["window_size"].as_array(),
+            ) {
+                let f = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0);
+                let x = (f(&origin["x"]) + f(&tile[0]) + f(&offset[0])) as i32;
+                let y = (f(&origin["y"]) + f(&tile[1]) + f(&offset[1])) as i32;
+                let (w, h) = (f(&size[0]) as i32, f(&size[1]) as i32);
+                fields.extend([
+                    ("frame_x", Value::I32(x)),
+                    ("frame_y", Value::I32(y)),
+                    ("frame_w", Value::I32(w)),
+                    ("frame_h", Value::I32(h)),
+                    ("client_x", Value::I32(x)),
+                    ("client_y", Value::I32(y)),
+                    ("client_w", Value::I32(w)),
+                    ("client_h", Value::I32(h)),
+                ]);
+            }
+            dict(fields)
+        })
+        .collect()
 }
 
 /* ----- selectors ----- */

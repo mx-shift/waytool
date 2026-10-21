@@ -48,8 +48,8 @@ use clap::{Parser, Subcommand};
                   screen capture protocols, which ask nothing.\n\
                   \n\
                   [windows]  Needs the desktop's window information: the waytool \
-                  gnome-shell extension on GNOME, or sway's IPC. Without one these commands \
-                  fail with an error saying so.\n\
+                  gnome-shell extension on GNOME, or the compositor's IPC on sway and niri. \
+                  Without one these commands fail with an error saying so.\n\
                   \n\
                   Every command except `daemon` talks to the running daemon, so start it first \
                   with `waytool daemon`. Commands then return almost at once."
@@ -322,7 +322,8 @@ enum Cmd {
     /// screenshot pixels by the monitor's scale. Points outside the window
     /// are rejected, and so is a window that doesn't take focus (a modal
     /// dialog has it, say); the error names the window that has it. A
-    /// following `key` or `type` goes to the same window.
+    /// following `key` or `type` goes to the same window. Needs window
+    /// positions, which niri gives only for floating windows.
     ClickIn {
         /// Window id, or a pattern matching one window's wm_class, app_id
         /// or title.
