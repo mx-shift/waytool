@@ -77,7 +77,9 @@ pub struct Frame {
     pub rgba: zvariant::OwnedFd,
 }
 
-/// A monitor's fields: `a{sv}` with keys like `name`, `x`, `scale`.
+/// A window or monitor as the gnome-shell extension describes it,
+/// passed through unchanged: `a{sv}` with keys like `id`, `title`,
+/// `frame_x`, `scale`.
 pub type WindowDict = std::collections::HashMap<String, zvariant::OwnedValue>;
 
 /// Render a dict value as text. zvariant doesn't implement Display on
@@ -161,8 +163,19 @@ pub trait Daemon {
     /// Capture one frame per stream, in stream index order.
     fn screenshot(&self) -> Result<Vec<Frame>, Error>;
 
+    /* ----- these need the gnome-shell extension ----- */
+
+    /// Visible top-level windows.
+    fn windows(&self) -> Result<Vec<WindowDict>, Error>;
+    /// One window by id.
+    fn window(&self, id: u64) -> Result<WindowDict, Error>;
+    /// Activate (focus + raise) a window by id.
+    fn focus(&self, id: u64) -> Result<(), Error>;
     /// Monitors with geometry and scale.
     fn monitors(&self) -> Result<Vec<WindowDict>, Error>;
+    /// Windows whose wm_class/app_id/title contains `pattern`. Errors
+    /// unless exactly one matches, or `all` is set.
+    fn find_window(&self, pattern: &str, all: bool) -> Result<Vec<WindowDict>, Error>;
 }
 
 /// Connect to the running daemon.

@@ -2,9 +2,9 @@
 //!
 //! Architecture:
 //! - `waytool daemon` establishes one RemoteDesktop + ScreenCast
-//!   portal session, connects its input through libei (`eis`), then
-//!   serves the D-Bus interface in `protocol` peer-to-peer on a unix
-//!   socket.
+//!   portal session, connects its input through libei (`eis`), finds
+//!   the desktop's window source (`windows`), then serves the D-Bus
+//!   interface in `protocol` peer-to-peer on a unix socket.
 //! - All other subcommands (`key`, `type`, `click`, `screenshot`, ...)
 //!   are thin clients that connect to the socket and make one call.
 //!
@@ -34,6 +34,7 @@ use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, wa
 
 use crate::portal::Portal;
 use crate::protocol::{Error, Frame, StreamDesc, WindowDict};
+use crate::windows::{Windows, summarize_windows, window_matches};
 
 /// Tell systemd about our state when run as a `Type=notify` unit
 /// (`READY=1`, `STATUS=...`). A no-op outside systemd. Readiness is
@@ -79,8 +80,10 @@ pub(crate) struct Daemon {
     reestablishing: AtomicBool,
     /// Asks the main loop to shut down, the same way SIGTERM does.
     shutdown: Notify,
-    /// The session bus.
+    /// The session bus, for the extension.
     bus: zbus::Connection,
+    /// Where window information comes from on this desktop.
+    windows: Windows,
     /// The monitor layout, from the daemon's own Wayland connection.
     outputs: Arc<crate::wayland::Wayland>,
 }
@@ -415,6 +418,8 @@ pub async fn run_daemon() -> Result<()> {
         portal.streams().len()
     );
 
+    let windows = Windows::detect(&bus, &outputs).await;
+    eprintln!("waytool: windows from {}", windows.describe());
     let daemon = Arc::new(Daemon {
         portal: std::sync::Mutex::new(portal.clone()),
         input: Mutex::new(()),
@@ -422,6 +427,7 @@ pub async fn run_daemon() -> Result<()> {
         stopping: AtomicBool::new(false),
         reestablishing: AtomicBool::new(false),
         shutdown: Notify::new(),
+        windows,
         bus,
         outputs,
     });
@@ -704,8 +710,8 @@ impl Service {
         Ok(())
     }
 
-    /// Absolute move to global logical coordinates, the space monitor
-    /// rects are reported in.
+    /// Absolute move to global logical coordinates, the space the
+    /// extension reports window and monitor rects in.
     async fn move_global(&self, x: f64, y: f64) -> Result<(), Error> {
         let _call = self.admit()?;
         finite(&[x, y])?;
@@ -830,6 +836,28 @@ impl Service {
         Ok(frames)
     }
 
+    /* ----- these need the desktop's window provider (see `windows`) ----- */
+
+    /// Top-level windows (minimized ones too), as the extension's dicts.
+    async fn windows(&self) -> Result<Vec<WindowDict>, Error> {
+        let _call = self.admit()?;
+        Ok(self.daemon.windows.list().await?)
+    }
+
+    /// One window's dict by id.
+    async fn window(&self, id: u64) -> Result<WindowDict, Error> {
+        let _call = self.admit()?;
+        Ok(self.daemon.windows.get(id).await?)
+    }
+
+    /// Activate a window by id: switch to its workspace, raise and focus
+    /// it.
+    async fn focus(&self, id: u64) -> Result<(), Error> {
+        let _call = self.admit()?;
+        self.daemon.windows.focus(id).await?;
+        Ok(())
+    }
+
     /// Monitors: index, connector name, description, rect in global
     /// logical coordinates, and scale.
     async fn monitors(&self) -> Result<Vec<WindowDict>, Error> {
@@ -858,6 +886,29 @@ impl Service {
                 ])
             })
             .collect()
+    }
+
+    /// Windows whose wm_class/app_id/title contains `pattern`
+    /// (case-insensitive). Exactly one match is required unless `all`
+    /// is set; several matches is an error listing the candidates.
+    async fn find_window(&self, pattern: String, all: bool) -> Result<Vec<WindowDict>, Error> {
+        let _call = self.admit()?;
+        let windows: Vec<WindowDict> = self.daemon.windows.list().await?;
+        let matches: Vec<WindowDict> = windows
+            .into_iter()
+            .filter(|w| window_matches(w, &pattern))
+            .collect();
+        match matches.len() {
+            0 => Err(anyhow!("no window matched {pattern:?}").into()),
+            1 => Ok(matches),
+            _ if all => Ok(matches),
+            n => Err(anyhow!(
+                "{n} windows match {pattern:?} — refine the pattern, target one \
+                 by id (`window <id>`), or pass --all to list every match:\n{}",
+                summarize_windows(&matches)
+            )
+            .into()),
+        }
     }
 }
 

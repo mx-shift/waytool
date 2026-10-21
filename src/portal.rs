@@ -21,8 +21,8 @@ use crate::eis::Eis;
 
 /// One portal stream: its PipeWire node, and, when the source is a
 /// monitor, the monitor's rect in global logical coordinates (the
-/// compositor's layout). A screenshot of it is the rect's size times
-/// the monitor's scale.
+/// compositor's layout, the space window rects are reported in). A
+/// screenshot of it is the rect's size times the monitor's scale.
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
     pub node_id: u32,

@@ -7,6 +7,7 @@
 //! The connection is read on a thread of its own, which keeps the
 //! layout current and tells the daemon when it changes.
 
+use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
@@ -32,8 +33,9 @@ pub(crate) struct Monitor {
     pub scale: f64,
 }
 
-/// The layout, kept current by the connection's thread.
+/// The connection, and the layout its thread keeps current.
 pub(crate) struct Wayland {
+    conn: Connection,
     monitors: Arc<Mutex<Vec<Monitor>>>,
     changes: tokio::sync::watch::Receiver<u64>,
 }
@@ -81,7 +83,11 @@ impl Wayland {
                 }
             })
             .context("start the Wayland thread")?;
-        Ok(Arc::new(Wayland { monitors, changes }))
+        Ok(Arc::new(Wayland {
+            conn,
+            monitors,
+            changes,
+        }))
     }
 
     /// The current layout, in the compositor's announcement order.
@@ -92,6 +98,31 @@ impl Wayland {
     /// A receiver that changes whenever the layout does.
     pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changes.clone()
+    }
+
+    /// The compositor's process id, from the Wayland socket's peer
+    /// credentials: which compositor we're actually talking to, when
+    /// several run (one nested in another).
+    pub(crate) fn compositor_pid(&self) -> Option<u32> {
+        use std::os::fd::AsRawFd;
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: SO_PEERCRED fills a ucred of `len` bytes on a valid
+        // socket fd, which the connection keeps open.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.conn.as_fd().as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
     }
 }
 

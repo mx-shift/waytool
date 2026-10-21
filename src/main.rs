@@ -1,6 +1,7 @@
-//! waytool: command-line keyboard and pointer input and screenshots
-//! on Wayland, through the freedesktop RemoteDesktop and ScreenCast
-//! portals.
+//! waytool: command-line keyboard and pointer input, screenshots
+//! and window control on Wayland, through the freedesktop RemoteDesktop
+//! and ScreenCast portals, with window information from the desktop's
+//! own source (see `windows`).
 //!
 //! Architecture: one persistent daemon owns the session; every other
 //! subcommand (`key`, `type`, `click`, `screenshot`, ...) is a thin
@@ -18,22 +19,28 @@ mod capture;
 mod daemon;
 mod display;
 mod eis;
+mod extension;
 mod keys;
 mod portal;
 mod protocol;
 mod wayland;
+mod windows;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Keyboard and pointer input and screenshots on Wayland.",
-    long_about = "Keyboard and pointer input and screenshots on Wayland.\n\
+    about = "Keyboard and pointer input, screenshots and window control on Wayland.",
+    long_about = "Keyboard and pointer input, screenshots and window control on Wayland.\n\
                   \n\
                   Input and screenshots go through the RemoteDesktop and ScreenCast portals, \
                   which need libei (GNOME 45+, KDE Plasma 6.1+, COSMIC); the daemon asks for \
                   screen-sharing consent when it starts.\n\
+                  \n\
+                  [windows]  Needs the desktop's window information: on GNOME, the waytool \
+                  gnome-shell extension. Without it these commands fail with an error saying \
+                  so.\n\
                   \n\
                   Every command except `daemon` talks to the running daemon, so start it first \
                   with `waytool daemon`. Commands then return almost at once."
@@ -143,7 +150,7 @@ enum Cmd {
 
     /// Move the pointer to a global logical coordinate.
     ///
-    /// The space `monitors` reports rects in.
+    /// The space `windows` and `monitors` report rects in.
     MoveGlobal {
         /// Global logical x.
         x: f64,
@@ -207,7 +214,8 @@ enum Cmd {
 
     /// Move to a global logical coordinate and click.
     ///
-    /// Coordinates as for `move-global`.
+    /// Feed it a point from `windows` or `find-window`, such as one inside
+    /// the frame (`frame_x`…`frame_h`) or client rect.
     ClickGlobal {
         /// Global logical x.
         x: f64,
@@ -239,8 +247,8 @@ enum Cmd {
 
     /// Print which stream covers a global logical point.
     ///
-    /// Useful for turning a global point into the stream to screenshot or
-    /// click on.
+    /// Useful for turning a window position (from `find-window`) into the
+    /// stream to screenshot or click on.
     StreamAt {
         /// Global logical x.
         x: f64,
@@ -248,7 +256,28 @@ enum Cmd {
         y: f64,
     },
 
-    /* ----- monitors ----- */
+    /* ----- windows and monitors ----- */
+    /// [windows] List top-level windows (normal windows and dialogs, minimized ones included).
+    ///
+    /// Fields: id, title, wm_class, app_id, pid, monitor, is_x11, the frame
+    /// rect (`frame_x`, `frame_y`, `frame_w`, `frame_h`, with decorations)
+    /// and client rect (`client_x`…`client_h`) in global logical
+    /// coordinates, focused, minimized, maximized, fullscreen,
+    /// on_all_workspaces, workspace and on_active_workspace.
+    Windows,
+
+    /// [windows] Print one window's fields by id (from `windows`).
+    Window {
+        /// Window id.
+        id: u64,
+    },
+
+    /// [windows] Focus a window by id: switch to its workspace, raise it, and give it keyboard focus.
+    Focus {
+        /// Window id.
+        id: u64,
+    },
+
     /// List monitors: index, connector name (e.g. DP-1), description, rect in global logical coordinates, scale.
     ///
     /// Read from the compositor's Wayland outputs (wl_output and
@@ -256,6 +285,20 @@ enum Cmd {
     /// pixels per logical pixel: a screenshot of the monitor is its size
     /// times this.
     Monitors,
+
+    /// [windows] Find the window whose wm_class, app_id or title contains a pattern.
+    ///
+    /// The match ignores case. One match prints its fields; several are an
+    /// error listing each candidate, so you can refine the pattern or use
+    /// an id, unless `--all` asks for every match.
+    FindWindow {
+        /// Text to look for.
+        pattern: String,
+        /// Print every matching window instead of failing when there are
+        /// several.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -335,16 +378,32 @@ async fn call(cmd: Cmd) -> Result<()> {
         Cmd::StreamAt { x, y } => {
             println!("{}", d.stream_at(x, y).await.map_err(protocol::describe)?);
         }
+        Cmd::Windows => {
+            let windows = d.windows().await.map_err(protocol::describe)?;
+            println!("{}", fmt_dicts("window", &windows));
+        }
+        Cmd::Window { id } => {
+            let window = d.window(id).await.map_err(protocol::describe)?;
+            println!("{}", fmt_dicts("window", &[window]));
+        }
+        Cmd::Focus { id } => d.focus(id).await.map_err(protocol::describe)?,
         Cmd::Monitors => {
             let monitors = d.monitors().await.map_err(protocol::describe)?;
             println!("{}", fmt_dicts("monitor", &monitors));
+        }
+        Cmd::FindWindow { pattern, all } => {
+            let matches = d
+                .find_window(&pattern, all)
+                .await
+                .map_err(protocol::describe)?;
+            println!("{}", fmt_dicts("match", &matches));
         }
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())
 }
 
-/// Print dicts as `key<TAB>value` lines, sorted by key, under
+/// Print extension dicts as `key<TAB>value` lines, sorted by key, under
 /// a `--- label[i] ---` header per dict.
 fn fmt_dicts(label: &str, dicts: &[protocol::WindowDict]) -> String {
     if dicts.is_empty() {
