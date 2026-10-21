@@ -4,7 +4,7 @@
 //! - `waytool daemon` establishes one RemoteDesktop portal session,
 //!   connects its input through libei (`eis`), then serves the D-Bus
 //!   interface in `protocol` peer-to-peer on a unix socket.
-//! - All other subcommands (`key`, `key-chord`, ...)
+//! - All other subcommands (`key`, `type`, ...)
 //!   are thin clients that connect to the socket and make one call.
 //!
 //! Why a daemon: a portal session costs a consent dialog. The portal's
@@ -35,7 +35,8 @@ pub(crate) struct Daemon {
     /// The portal session.
     portal: Arc<Portal>,
     /// Serializes input requests, so one client's keystrokes never
-    /// interleave with another's.
+    /// interleave with another's. Read-only requests don't take it, so
+    /// a long `type` doesn't block them.
     input: Mutex<()>,
 }
 
@@ -218,6 +219,30 @@ fn keysym(name: &str) -> Result<u32> {
         .ok_or_else(|| anyhow!("unknown key name {name:?} (see `waytool key --help`)"))
 }
 
+/// Type `text` into whatever currently holds keyboard focus, one
+/// press+release per character.
+///
+/// A character that isn't on the keyboard layout can't be sent as a key
+/// press at all, so it's refused. Everything is checked before the
+/// first keystroke, so a string that can't be typed types nothing.
+async fn type_text(portal: &Portal, text: &str) -> Result<()> {
+    let mut syms = Vec::new();
+    for ch in text.chars() {
+        let sym = crate::keys::keysym_for_char(ch)
+            .ok_or_else(|| anyhow!("can't type {ch:?}: it has no keysym (nothing was typed)"))?;
+        if !portal.has_keysym(sym)? {
+            return Err(anyhow!(
+                "{ch:?} isn't on the keyboard layout, so it can't be typed (nothing was typed)"
+            ));
+        }
+        syms.push(sym);
+    }
+    for sym in syms {
+        portal.tap_keysym(sym)?;
+    }
+    Ok(())
+}
+
 /// Press `syms` in order, then release them in reverse so the first
 /// (the modifier) is the last to come up — the held-modifier discipline
 /// emulators expect. If a press fails, the keys already down are still
@@ -321,6 +346,13 @@ impl Service {
         let sym = keysym(&name)?;
         let (_input, portal) = self.daemon.input().await?;
         portal.keysym(sym, false)?;
+        Ok(())
+    }
+
+    async fn type_text(&self, text: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let (_input, portal) = self.daemon.input().await?;
+        type_text(&portal, &text).await?;
         Ok(())
     }
 }

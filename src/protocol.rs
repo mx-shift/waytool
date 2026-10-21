@@ -80,6 +80,8 @@ pub trait Daemon {
     fn key_down(&self, name: &str) -> Result<(), Error>;
     /// Release a keysym held with KeyDown.
     fn key_up(&self, name: &str) -> Result<(), Error>;
+    /// Type a UTF-8 string, one press+release per character.
+    fn type_text(&self, text: &str) -> Result<(), Error>;
 }
 
 /// Connect to the running daemon.

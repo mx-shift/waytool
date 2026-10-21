@@ -320,6 +320,13 @@ impl Eis {
         Ok(())
     }
 
+    /// Whether `keysym` is on the current keyboard layout. An error if
+    /// there's no keyboard or keymap to tell from.
+    pub(crate) fn has_keysym(&self, keysym: u32) -> Result<bool> {
+        let st = self.state.lock().unwrap();
+        Ok(st.layout()?.places.contains_key(&canonical(keysym)))
+    }
+
     /// Press or release the key for `keysym`. A press adds the modifier
     /// keys its level needs, given the modifiers already in effect; the
     /// release lets go of the key and of exactly the modifiers its press

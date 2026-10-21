@@ -42,6 +42,12 @@ impl Portal {
         })
     }
 
+    /// Whether `keysym` is on the keyboard layout, so it can be typed as
+    /// a key.
+    pub(crate) fn has_keysym(&self, keysym: u32) -> Result<bool> {
+        self.eis.has_keysym(keysym)
+    }
+
     /// Press or release the key for `keysym`.
     pub(crate) fn keysym(&self, keysym: u32, press: bool) -> Result<()> {
         self.eis.keysym(keysym, press)

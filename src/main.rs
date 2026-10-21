@@ -2,7 +2,7 @@
 //! freedesktop RemoteDesktop portal.
 //!
 //! Architecture: one persistent daemon owns the session; every other
-//! subcommand (`key`, `key-chord`, ...) is a thin
+//! subcommand (`key`, `type`, ...) is a thin
 //! client that connects to `$XDG_RUNTIME_DIR/waytool.sock` and
 //! makes one D-Bus call (see `protocol`).
 //!
@@ -92,6 +92,18 @@ enum Cmd {
         /// A key name, as for `key`.
         name: String,
     },
+
+    /// Type a UTF-8 string, one key press and release per character.
+    ///
+    /// A newline or tab types Return or Tab, and the modifiers each
+    /// character's level needs are pressed with it; use `key-chord` for
+    /// shortcuts. A character that isn't on the keyboard layout (an emoji,
+    /// say) can't be typed; a string with one is rejected before anything
+    /// is typed.
+    Type {
+        /// The text to type.
+        text: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -116,6 +128,7 @@ async fn call(cmd: Cmd) -> Result<()> {
         Cmd::KeyCode { code } => d.key_code(code).await.map_err(protocol::describe)?,
         Cmd::KeyDown { name } => d.key_down(&name).await.map_err(protocol::describe)?,
         Cmd::KeyUp { name } => d.key_up(&name).await.map_err(protocol::describe)?,
+        Cmd::Type { text } => d.type_text(&text).await.map_err(protocol::describe)?,
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())
