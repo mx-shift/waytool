@@ -90,6 +90,20 @@ grep -q 'x, y: 1273.33' "$work/wev.log" || fail "pixel (1910, 1070) at scale 1.5
 grep -q 'button: 273 (right), state: 0' "$work/wev.log" || fail "no right click"
 grep -q 'x, y: 100.500000, 200.250000' "$work/wev.log" || fail "move-global didn't reach (100.5, 200.25)"
 
+echo "windows"
+waytool windows | grep -q "^app_id.foot$" || fail "windows doesn't list foot"
+waytool type-in foot " typed-in"
+sleep 0.5
+case "$(cat "$work/typed.txt")" in
+*" typed-in") ;;
+*) fail "type-in foot typed [$(cat "$work/typed.txt")]" ;;
+esac
+: > "$work/wev.log"
+waytool click-in wev 10 20
+sleep 0.5
+grep -q 'x, y: 10.000000, 20.000000' "$work/wev.log" || fail "click-in wev 10 20 didn't land at (10, 20)"
+grep -q 'button: 272 (left), state: 1' "$work/wev.log" || fail "click-in didn't click"
+
 echo "rotated output"
 swaymsg output HEADLESS-2 transform 90 > /dev/null
 sleep 0.5

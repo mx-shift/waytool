@@ -47,9 +47,9 @@ use clap::{Parser, Subcommand};
                   other wlroots compositors, Hyprland, niri) through Wayland's virtual input and \
                   screen capture protocols, which ask nothing.\n\
                   \n\
-                  [windows]  Needs the desktop's window information: on GNOME, the waytool \
-                  gnome-shell extension. Without it these commands fail with an error saying \
-                  so.\n\
+                  [windows]  Needs the desktop's window information: the waytool \
+                  gnome-shell extension on GNOME, or sway's IPC. Without one these commands \
+                  fail with an error saying so.\n\
                   \n\
                   Every command except `daemon` talks to the running daemon, so start it first \
                   with `waytool daemon`. Commands then return almost at once."

@@ -1,12 +1,18 @@
 //! Windows: listing them, focusing one, and finding the one a selector
 //! names. Every desktop has its own way to do this, and no Wayland
 //! protocol gives a window's geometry, so there's a provider per desktop:
-//! the gnome-shell extension on GNOME. It reports a window as a dict
-//! (see `windows` in the CLI help).
+//! the gnome-shell extension on GNOME, and the compositor's IPC socket
+//! on sway. Each reports a window as a dict with the same fields (see
+//! `windows` in the CLI help), leaving out what its desktop doesn't
+//! know.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use zvariant::{OwnedValue, Value};
 
 use crate::extension::{ext_call, ext_proxy};
 use crate::protocol::{WindowDict, render_value};
@@ -16,6 +22,8 @@ use crate::wayland::Wayland;
 pub(crate) enum Windows {
     /// The gnome-shell extension, on the session bus.
     Gnome(zbus::Connection),
+    /// sway's IPC socket.
+    Sway(PathBuf),
     /// No provider: why.
     Unavailable(String),
 }
@@ -25,6 +33,19 @@ impl Windows {
     /// connection reaches.
     pub(crate) async fn detect(bus: &zbus::Connection, wayland: &Arc<Wayland>) -> Windows {
         let compositor = wayland.compositor_pid();
+        // The compositor sets these for the programs it starts.
+        if let Some(sock) = env_socket("SWAYSOCK") {
+            return Windows::Sway(sock);
+        }
+        // Otherwise (a systemd unit the variables didn't reach), the IPC
+        // socket our compositor made: sway names its with its pid.
+        if let Some(pid) = compositor
+            && let Some(sock) = runtime_socket(|n| {
+                n.starts_with("sway-ipc.") && n.ends_with(&format!(".{pid}.sock"))
+            })
+        {
+            return Windows::Sway(sock);
+        }
         // gnome-shell, if it's the compositor (not just on the bus, as it
         // is for a compositor nested inside GNOME).
         if let Some(shell) = bus_name_pid(bus, "org.gnome.Shell").await
@@ -33,7 +54,9 @@ impl Windows {
             return Windows::Gnome(bus.clone());
         }
         Windows::Unavailable(
-            "this desktop has no window provider (GNOME with the waytool extension)".into(),
+            "this desktop has no window provider (GNOME with the waytool extension, \
+             or sway)"
+                .into(),
         )
     }
 
@@ -41,6 +64,7 @@ impl Windows {
     pub(crate) fn describe(&self) -> String {
         match self {
             Windows::Gnome(_) => "the gnome-shell extension".into(),
+            Windows::Sway(sock) => format!("sway ({})", sock.display()),
             Windows::Unavailable(why) => format!("nowhere: {why}"),
         }
     }
@@ -49,6 +73,7 @@ impl Windows {
     pub(crate) async fn list(&self) -> Result<Vec<WindowDict>> {
         match self {
             Windows::Gnome(bus) => ext_call(&ext_proxy(bus).await?, "GetWindows", &()).await,
+            Windows::Sway(sock) => sway_windows(sock).await,
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
     }
@@ -72,6 +97,7 @@ impl Windows {
     pub(crate) async fn focus(&self, id: u64) -> Result<()> {
         match self {
             Windows::Gnome(bus) => ext_call(&ext_proxy(bus).await?, "FocusWindow", &(id,)).await,
+            Windows::Sway(sock) => sway_command(sock, &format!("[con_id={id}] focus")).await,
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
     }
@@ -119,11 +145,161 @@ impl Windows {
     }
 }
 
+/// A window dict from its fields.
+fn dict(entries: Vec<(&str, Value)>) -> Result<WindowDict> {
+    entries
+        .into_iter()
+        .map(|(k, v)| Ok((k.to_owned(), OwnedValue::try_from(v)?)))
+        .collect()
+}
+
+/// The socket an environment variable names, if it exists.
+fn env_socket(var: &str) -> Option<PathBuf> {
+    let sock = PathBuf::from(std::env::var_os(var)?);
+    sock.exists().then_some(sock)
+}
+
+/// The socket in XDG_RUNTIME_DIR whose name `matches`.
+fn runtime_socket(matches: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(&matches))
+}
+
 /// The pid of the process that owns `name` on the bus, if any.
 async fn bus_name_pid(bus: &zbus::Connection, name: &str) -> Option<u32> {
     let dbus = zbus::fdo::DBusProxy::new(bus).await.ok()?;
     let name = zbus::names::BusName::try_from(name).ok()?;
     dbus.get_connection_unix_process_id(name).await.ok()
+}
+
+/* ----- sway ----- */
+
+/// One sway IPC exchange: a message of `kind` with `payload`, and the
+/// reply's JSON (sway-ipc(7)).
+async fn sway_ipc(sock: &Path, kind: u32, payload: &str) -> Result<serde_json::Value> {
+    let mut stream = UnixStream::connect(sock)
+        .await
+        .with_context(|| format!("connect to sway at {}", sock.display()))?;
+    let mut msg = b"i3-ipc".to_vec();
+    msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    msg.extend_from_slice(&kind.to_le_bytes());
+    msg.extend_from_slice(payload.as_bytes());
+    stream.write_all(&msg).await.context("sway IPC write")?;
+    let mut header = [0u8; 14];
+    stream
+        .read_exact(&mut header)
+        .await
+        .context("sway IPC read")?;
+    if &header[..6] != b"i3-ipc" {
+        return Err(anyhow!("sway IPC: bad reply header"));
+    }
+    let len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+    let mut body = vec![0; len];
+    stream
+        .read_exact(&mut body)
+        .await
+        .context("sway IPC read")?;
+    serde_json::from_slice(&body).context("sway IPC reply")
+}
+
+const SWAY_RUN_COMMAND: u32 = 0;
+const SWAY_GET_TREE: u32 = 4;
+
+async fn sway_command(sock: &Path, command: &str) -> Result<()> {
+    let reply = sway_ipc(sock, SWAY_RUN_COMMAND, command).await?;
+    let first = &reply[0];
+    if first["success"].as_bool() != Some(true) {
+        return Err(anyhow!(
+            "sway: {}",
+            first["error"].as_str().unwrap_or("the command failed")
+        ));
+    }
+    Ok(())
+}
+
+async fn sway_windows(sock: &Path) -> Result<Vec<WindowDict>> {
+    let tree = sway_ipc(sock, SWAY_GET_TREE, "").await?;
+    let mut out = Vec::new();
+    sway_collect(&tree, "", None, &mut out)?;
+    Ok(out)
+}
+
+/// Walk sway's tree, collecting views (nodes with a pid) with the output
+/// and workspace they're on.
+fn sway_collect(
+    node: &serde_json::Value,
+    output: &str,
+    workspace: Option<&serde_json::Value>,
+    out: &mut Vec<WindowDict>,
+) -> Result<()> {
+    let (output, workspace) = match node["type"].as_str() {
+        Some("output") => (node["name"].as_str().unwrap_or(output), workspace),
+        Some("workspace") => (output, Some(node)),
+        _ => (output, workspace),
+    };
+    if node["pid"].is_number() {
+        out.push(sway_window(node, output, workspace)?);
+    }
+    for key in ["nodes", "floating_nodes"] {
+        for child in node[key].as_array().into_iter().flatten() {
+            sway_collect(child, output, workspace, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn sway_window(
+    n: &serde_json::Value,
+    output: &str,
+    workspace: Option<&serde_json::Value>,
+) -> Result<WindowDict> {
+    let num = |v: &serde_json::Value| v.as_i64().unwrap_or(0) as i32;
+    let rect = &n["rect"];
+    let inner = &n["window_rect"];
+    let is_x11 = n["shell"].as_str() == Some("xwayland");
+    let app_id = n["app_id"].as_str().unwrap_or("").to_owned();
+    let class = n["window_properties"]["class"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    let ws_name = workspace.and_then(|w| w["name"].as_str()).unwrap_or("");
+    dict(vec![
+        ("id", Value::U64(n["id"].as_u64().unwrap_or(0))),
+        ("title", n["name"].as_str().unwrap_or("").into()),
+        ("app_id", app_id.clone().into()),
+        ("wm_class", if is_x11 { class } else { app_id }.into()),
+        ("pid", Value::I32(num(&n["pid"]))),
+        ("monitor", output.into()),
+        ("is_x11", is_x11.into()),
+        ("frame_x", Value::I32(num(&rect["x"]))),
+        ("frame_y", Value::I32(num(&rect["y"]))),
+        ("frame_w", Value::I32(num(&rect["width"]))),
+        ("frame_h", Value::I32(num(&rect["height"]))),
+        ("client_x", Value::I32(num(&rect["x"]) + num(&inner["x"]))),
+        ("client_y", Value::I32(num(&rect["y"]) + num(&inner["y"]))),
+        ("client_w", Value::I32(num(&inner["width"]))),
+        ("client_h", Value::I32(num(&inner["height"]))),
+        ("focused", n["focused"].as_bool().unwrap_or(false).into()),
+        // The scratchpad is sway's nearest thing to minimizing.
+        ("minimized", (ws_name == "__i3_scratch").into()),
+        (
+            "fullscreen",
+            (n["fullscreen_mode"].as_i64().unwrap_or(0) != 0).into(),
+        ),
+        (
+            "on_all_workspaces",
+            n["sticky"].as_bool().unwrap_or(false).into(),
+        ),
+        ("workspace", ws_name.into()),
+        (
+            "on_active_workspace",
+            n["visible"].as_bool().unwrap_or(false).into(),
+        ),
+    ])
 }
 
 /* ----- selectors ----- */
