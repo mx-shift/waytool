@@ -255,6 +255,8 @@ pub(crate) struct Eis {
     connection: reis::event::Connection,
     state: Arc<Mutex<State>>,
     sequence: AtomicU32,
+    /// Notified once when the connection is lost.
+    lost: Arc<tokio::sync::Notify>,
     /// The connection's socket, shut down on drop so the libei thread
     /// sees end-of-stream and exits whether or not the compositor ever
     /// closes its side.
@@ -277,14 +279,19 @@ impl Eis {
     /// closes.
     pub(crate) async fn connect(fd: OwnedFd) -> Result<Eis> {
         let state = Arc::new(Mutex::new(State::default()));
+        let lost = Arc::new(tokio::sync::Notify::new());
         let socket = UnixStream::from(fd);
         let thread_socket = socket.try_clone().context("duplicate the libei socket")?;
         let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let thread_state = state.clone();
+        let thread_lost = lost.clone();
         std::thread::Builder::new()
             .name("libei".into())
-            .spawn(move || run_events(thread_socket, thread_state, connected_tx, ready_tx))
+            .spawn(move || {
+                run_events(thread_socket, thread_state, connected_tx, ready_tx);
+                thread_lost.notify_one();
+            })
             .context("start the libei thread")?;
 
         let connection = connected_rx
@@ -294,6 +301,7 @@ impl Eis {
             connection,
             state,
             sequence: AtomicU32::new(0),
+            lost,
             socket,
         };
 
@@ -313,6 +321,12 @@ impl Eis {
         }
         drop(st);
         Ok(eis)
+    }
+
+    /// Wait until the connection is lost: the compositor disconnected
+    /// us, or the event stream failed. Input can't be sent after that.
+    pub(crate) async fn lost(&self) {
+        self.lost.notified().await;
     }
 
     /// Send events through interface `T` of one device, as one frame.

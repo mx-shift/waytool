@@ -23,14 +23,38 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::portal::Portal;
 use crate::protocol::{Error, Frame, StreamDesc};
+
+/// Tell systemd about our state when run as a `Type=notify` unit
+/// (`READY=1`, `STATUS=...`). A no-op outside systemd. Readiness is
+/// only signalled once the portal session is up and the socket is
+/// listening, so the unit stays "activating" while the consent dialog
+/// is pending — which is what the gnome-shell toggle shows as
+/// "waiting for consent".
+fn sd_notify(msg: &str) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let path = path.to_string_lossy().into_owned();
+    let addr = match path.strip_prefix('@') {
+        Some(name) => SocketAddr::from_abstract_name(name.as_bytes()),
+        None => SocketAddr::from_pathname(&path),
+    };
+    let sent = addr.and_then(|addr| UnixDatagram::unbound()?.send_to_addr(msg.as_bytes(), &addr));
+    if let Err(e) = sent {
+        eprintln!("waytool: sd_notify({msg:?}) failed: {e}");
+    }
+}
 
 /// State shared by every client connection.
 pub(crate) struct Daemon {
@@ -44,6 +68,10 @@ pub(crate) struct Daemon {
     /// instead of each standing up its own set of streams on the same
     /// nodes.
     capture: Mutex<()>,
+    /// Set once shutdown starts, so the session watcher doesn't race it.
+    stopping: AtomicBool,
+    /// Asks the main loop to shut down, the same way SIGTERM does.
+    shutdown: Notify,
 }
 
 impl Daemon {
@@ -56,6 +84,34 @@ impl Daemon {
         let guard = self.input.lock().await;
         Ok((guard, self.portal()))
     }
+}
+
+/// Watch a portal session and shut the daemon down when it ends: the
+/// portal closed it (the user stopped sharing, or revoked consent), or
+/// its libei connection was lost, so input can no longer be sent.
+fn spawn_session_watcher(portal: &Arc<Portal>, daemon: Arc<Daemon>) {
+    let portal = portal.clone();
+    tokio::spawn(async move {
+        let mut closed = match portal.session.receive_closed().await {
+            Ok(closed) => closed,
+            Err(e) => {
+                eprintln!(
+                    "waytool: could not watch session Closed signal ({e:#}); \
+                     daemon will not auto-exit when capture stops"
+                );
+                return;
+            }
+        };
+        let why = tokio::select! {
+            _ = closed.next() => "portal session closed (screen sharing stopped or consent revoked)",
+            _ = portal.input_lost() => "lost the libei input connection",
+        };
+        if daemon.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        eprintln!("waytool: {why}; shutting down");
+        daemon.shutdown.notify_one();
+    });
 }
 
 /// Most client connections served at once. Each CLI invocation is one
@@ -170,6 +226,10 @@ async fn accept_client(
 }
 
 pub async fn run_daemon() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+
     // Bind before asking for consent, so a second daemon fails here
     // instead of after the user has already clicked through a dialog.
     // Clients that connect meanwhile queue until the session is up, or
@@ -181,7 +241,13 @@ pub async fn run_daemon() -> Result<()> {
         .await
         .context("connect to the session bus")?;
     eprintln!("waytool: establishing portal session (consent prompt may appear)...");
-    let portal = Arc::new(Portal::establish(&bus).await?);
+    sd_notify("STATUS=Waiting for screen-sharing consent");
+    let portal = tokio::select! {
+        portal = Portal::establish(&bus) => Arc::new(portal?),
+        // Stopping the unit while the consent dialog is up.
+        _ = sigterm.recv() => return Ok(()),
+        _ = sigint.recv() => return Ok(()),
+    };
     eprintln!(
         "waytool: session ready, {} stream(s)",
         portal.streams().len()
@@ -191,37 +257,69 @@ pub async fn run_daemon() -> Result<()> {
         portal: portal.clone(),
         input: Mutex::new(()),
         capture: Mutex::new(()),
+        stopping: AtomicBool::new(false),
+        shutdown: Notify::new(),
     });
+
+    // Exit the daemon if the portal session ends out from under us.
+    spawn_session_watcher(&portal, daemon.clone());
 
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     eprintln!("waytool: listening on {}", sock.display());
+    sd_notify("READY=1\nSTATUS=Running");
 
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _addr)) => stream,
-            // Out of fds, or a connection aborted before it was
-            // accepted: nothing to do with the session, so carry on
-            // after a pause rather than spin.
-            Err(e) => {
-                eprintln!("waytool: accept failed: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok((stream, _addr)) => stream,
+                    // Out of fds, or a connection aborted before it was
+                    // accepted: nothing to do with the session, so carry
+                    // on after a pause rather than spin.
+                    Err(e) => {
+                        eprintln!("waytool: accept failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    eprintln!(
+                        "waytool: refusing a connection: {MAX_CONNECTIONS} already open"
+                    );
+                    continue;
+                };
+                let daemon = daemon.clone();
+                tokio::task::spawn(async move {
+                    if let Err(e) = accept_client(stream, daemon, permit).await {
+                        if gave_up_waiting(&e) {
+                            eprintln!(
+                                "waytool: a client gave up before the daemon was ready"
+                            );
+                        } else {
+                            eprintln!("waytool: client error: {e:#}");
+                        }
+                    }
+                });
             }
-        };
-        let Ok(permit) = connections.clone().try_acquire_owned() else {
-            eprintln!("waytool: refusing a connection: {MAX_CONNECTIONS} already open");
-            continue;
-        };
-        let daemon = daemon.clone();
-        tokio::task::spawn(async move {
-            if let Err(e) = accept_client(stream, daemon, permit).await {
-                if gave_up_waiting(&e) {
-                    eprintln!("waytool: a client gave up before the daemon was ready");
-                } else {
-                    eprintln!("waytool: client error: {e:#}");
-                }
-            }
-        });
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+            _ = daemon.shutdown.notified() => break,
+        }
+    }
+
+    shutdown(&daemon).await;
+    Ok(())
+}
+
+/// Close the portal session before exiting (portal Session.Close), so
+/// screen sharing ends now rather than whenever the portal notices the
+/// daemon has left the bus.
+async fn shutdown(daemon: &Daemon) {
+    eprintln!("waytool: shutting down; closing portal session");
+    sd_notify("STOPPING=1");
+    daemon.stopping.store(true, Ordering::SeqCst);
+    if let Err(e) = daemon.portal().session.close().await {
+        eprintln!("waytool: closing portal session failed: {e:#}");
     }
 }
 

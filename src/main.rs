@@ -48,7 +48,8 @@ enum Cmd {
     /// Run the daemon that holds the input and capture session.
     ///
     /// Each start asks for screen-sharing consent. Other commands reuse
-    /// the session until the daemon exits. Stop it with Ctrl-C.
+    /// the session until the daemon exits. Stop it with Ctrl-C, or from
+    /// the desktop's screen-sharing indicator.
     Daemon,
 
     /// Check that the daemon is up; prints `pong`.

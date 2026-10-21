@@ -85,6 +85,11 @@ impl Portal {
         })
     }
 
+    /// Wait until input through this session stops working for good.
+    pub(crate) async fn input_lost(&self) {
+        self.eis.lost().await
+    }
+
     /// The session's streams.
     pub(crate) fn streams(&self) -> &[StreamInfo] {
         &self.streams
