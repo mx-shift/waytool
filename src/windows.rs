@@ -1,11 +1,12 @@
 //! Windows: listing them, focusing one, and finding the one a selector
 //! names. Every desktop has its own way to do this, and no Wayland
 //! protocol gives a window's geometry, so there's a provider per desktop:
-//! the gnome-shell extension on GNOME, and the compositor's IPC socket on
-//! sway, niri and Hyprland. Elsewhere, wlr-foreign-toplevel-management or
-//! ext-foreign-toplevel-list lists windows, without geometry. Each
-//! reports a window as a dict with the same fields (see `windows` in the
-//! CLI help), leaving out what its desktop doesn't know.
+//! the gnome-shell extension on GNOME, a KWin script on KDE Plasma, and
+//! the compositor's IPC socket on sway, niri and Hyprland. Elsewhere,
+//! wlr-foreign-toplevel-management or ext-foreign-toplevel-list lists
+//! windows, without geometry. Each reports a window as a dict with the
+//! same fields (see `windows` in the CLI help), leaving out what its
+//! desktop doesn't know.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +30,8 @@ pub(crate) enum Windows {
     Niri(PathBuf),
     /// Hyprland's IPC socket.
     Hyprland(PathBuf),
+    /// KWin, through a script (see `kwin`).
+    Kwin(crate::kwin::Kwin),
     /// wlr-foreign-toplevel-management (titles, app ids, states, focus) or
     /// ext-foreign-toplevel-list (titles and app ids only): no geometry.
     Toplevels(Arc<Wayland>),
@@ -73,9 +76,17 @@ impl Windows {
         // gnome-shell, if it's the compositor (not just on the bus, as it
         // is for a compositor nested inside GNOME).
         if let Some(shell) = bus_name_pid(bus, "org.gnome.Shell").await
-            && compositor.is_none_or(|pid| pid == shell)
+            && compositor.is_none_or(|pid| same_compositor(pid, shell))
         {
             return Windows::Gnome(bus.clone());
+        }
+        if let Some(kwin) = bus_name_pid(bus, "org.kde.KWin").await
+            && compositor.is_none_or(|pid| same_compositor(pid, kwin))
+        {
+            return match crate::kwin::Kwin::new(bus).await {
+                Ok(kwin) => Windows::Kwin(kwin),
+                Err(e) => Windows::Unavailable(format!("{e:#}")),
+            };
         }
         let g = wayland.globals();
         if g.foreign_toplevel.is_some() || g.toplevel_list.is_some() {
@@ -83,7 +94,7 @@ impl Windows {
         }
         Windows::Unavailable(
             "this desktop has no window provider (GNOME with the waytool extension, \
-             sway, niri, Hyprland, or wlr-foreign-toplevel-management)"
+             KDE Plasma, sway, niri, Hyprland, or wlr-foreign-toplevel-management)"
                 .into(),
         )
     }
@@ -99,6 +110,7 @@ impl Windows {
                 "wlr-foreign-toplevel-management".into()
             }
             Windows::Toplevels(_) => "ext-foreign-toplevel-list".into(),
+            Windows::Kwin(_) => "KWin".into(),
             Windows::Unavailable(why) => format!("nowhere: {why}"),
         }
     }
@@ -112,6 +124,15 @@ impl Windows {
             Windows::Hyprland(sock) => hyprland_windows(sock).await,
             Windows::Toplevels(wayland) => {
                 wayland.toplevels().iter().map(toplevel_window).collect()
+            }
+            Windows::Kwin(kwin) => {
+                let reply = kwin.call(serde_json::json!({"op": "list"})).await?;
+                reply["windows"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(kwin_window)
+                    .collect()
             }
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
@@ -141,6 +162,10 @@ impl Windows {
                 let request = serde_json::json!({"Action": {"FocusWindow": {"id": id}}});
                 niri_request(sock, &request).await.map(|_| ())
             }
+            Windows::Kwin(kwin) => kwin
+                .call(serde_json::json!({"op": "focus", "id": format!("{id:016x}")}))
+                .await
+                .map(|_| ()),
             Windows::Toplevels(wayland) => {
                 let toplevel = wayland
                     .toplevels()
@@ -241,11 +266,79 @@ fn runtime_socket(matches: impl Fn(&str) -> bool) -> Option<PathBuf> {
         .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(&matches))
 }
 
+/// Whether `owner`, a bus name's process, is the compositor whose
+/// Wayland socket `socket` (the pid holding it) belongs to: the same
+/// process, or one it started — Plasma's kwin_wayland_wrapper makes the
+/// socket and runs kwin_wayland, which owns org.kde.KWin.
+fn same_compositor(socket: u32, owner: u32) -> bool {
+    let mut pid = owner;
+    for _ in 0..4 {
+        if pid == socket {
+            return true;
+        }
+        match parent_pid(pid) {
+            Some(parent) if parent > 1 => pid = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A process's parent, from /proc/<pid>/stat.
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is in parentheses and may hold spaces; the state
+    // and the parent pid follow its closing parenthesis.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// The pid of the process that owns `name` on the bus, if any.
 async fn bus_name_pid(bus: &zbus::Connection, name: &str) -> Option<u32> {
     let dbus = zbus::fdo::DBusProxy::new(bus).await.ok()?;
     let name = zbus::names::BusName::try_from(name).ok()?;
     dbus.get_connection_unix_process_id(name).await.ok()
+}
+
+/* ----- KWin ----- */
+
+/// A window as the KWin script describes it.
+fn kwin_window(w: &serde_json::Value) -> Result<WindowDict> {
+    let id = w["id"]
+        .as_str()
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .ok_or_else(|| anyhow!("KWin window without an id"))?;
+    let int = |v: &serde_json::Value| v.as_i64().unwrap_or(0) as i32;
+    let (f, c) = (&w["frame"], &w["client"]);
+    let text = |k: &str| w[k].as_str().unwrap_or("").to_owned();
+    let flag = |k: &str| w[k].as_bool().unwrap_or(false);
+    dict(vec![
+        ("id", Value::U64(id)),
+        ("title", text("title").into()),
+        ("app_id", text("app_id").into()),
+        ("wm_class", text("wm_class").into()),
+        ("pid", Value::I32(int(&w["pid"]))),
+        ("monitor", text("monitor").into()),
+        ("frame_x", Value::I32(int(&f[0]))),
+        ("frame_y", Value::I32(int(&f[1]))),
+        ("frame_w", Value::I32(int(&f[2]))),
+        ("frame_h", Value::I32(int(&f[3]))),
+        ("client_x", Value::I32(int(&c[0]))),
+        ("client_y", Value::I32(int(&c[1]))),
+        ("client_w", Value::I32(int(&c[2]))),
+        ("client_h", Value::I32(int(&c[3]))),
+        ("focused", flag("focused").into()),
+        ("minimized", flag("minimized").into()),
+        ("maximized", flag("maximized").into()),
+        ("fullscreen", flag("fullscreen").into()),
+        ("on_all_workspaces", flag("on_all_workspaces").into()),
+        ("workspace", text("workspace").into()),
+        ("on_active_workspace", flag("on_active_workspace").into()),
+    ])
 }
 
 /* ----- wlr-foreign-toplevel-management ----- */
@@ -733,6 +826,36 @@ mod tests {
         let bus = zbus::Connection::session().await.unwrap();
         let wayland = Wayland::connect().unwrap();
         println!("{}", Windows::detect(&bus, &wayland).await.describe());
+    }
+
+    /// Live: list windows through this session's provider, and focus the
+    /// first that isn't focused.
+    /// `cargo test -- --ignored windows_live --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn windows_live() {
+        let bus = zbus::Connection::session().await.unwrap();
+        let wayland = Wayland::connect().unwrap();
+        let windows = Windows::detect(&bus, &wayland).await;
+        println!("provider: {}", windows.describe());
+        let list = windows.list().await.unwrap();
+        println!("{}", summarize_windows(&list));
+        if let Some(w) = list.iter().find(|w| !dict_bool(w, "focused")) {
+            let id = dict_i64(w, "id").unwrap() as u64;
+            windows.focus(id).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(dict_bool(&windows.get(id).await.unwrap(), "focused"));
+            println!("focused {id}");
+        }
+    }
+
+    #[test]
+    fn a_compositor_is_its_own_or_its_parents() {
+        let me = std::process::id();
+        let parent = parent_pid(me).unwrap();
+        assert!(same_compositor(me, me));
+        assert!(same_compositor(parent, me));
+        assert!(!same_compositor(me, parent));
     }
 
     #[test]

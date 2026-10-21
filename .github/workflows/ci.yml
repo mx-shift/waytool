@@ -84,7 +84,7 @@ jobs:
         with:
           persist-credentials: false
       - run: shellcheck gnome-extension/install.sh systemd/make-unit.sh tests/integration/*.sh
-      - run: npx --yes eslint@10.12.0 gnome-extension
+      - run: npx --yes eslint@10.12.0 gnome-extension kwin
 
   # Portable binaries. Built on Debian 12, the oldest base the pipewire
   # crate compiles against (PipeWire 0.3.65); the result needs only

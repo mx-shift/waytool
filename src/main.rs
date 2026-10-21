@@ -26,6 +26,7 @@ mod eis;
 mod extension;
 mod keymap;
 mod keys;
+mod kwin;
 mod portal;
 mod protocol;
 mod wayland;
@@ -48,9 +49,10 @@ use clap::{Parser, Subcommand};
                   screen capture protocols, which ask nothing.\n\
                   \n\
                   [windows]  Needs the desktop's window information: the waytool \
-                  gnome-shell extension on GNOME, or the compositor's IPC on sway, niri and \
-                  Hyprland; elsewhere wlr-foreign-toplevel-management gives windows without \
-                  positions. Without one these commands fail with an error saying so.\n\
+                  gnome-shell extension on GNOME, the KWin script (installed with the packages) \
+                  on KDE Plasma, or the compositor's IPC on sway, niri and Hyprland; elsewhere \
+                  wlr-foreign-toplevel-management gives windows without positions. Without one \
+                  these commands fail with an error saying so.\n\
                   \n\
                   Every command except `daemon` talks to the running daemon, so start it first \
                   with `waytool daemon`. Commands then return almost at once."
