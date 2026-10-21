@@ -1,8 +1,9 @@
 //! Windows: listing them, focusing one, and finding the one a selector
 //! names. Every desktop has its own way to do this, and no Wayland
 //! protocol gives a window's geometry, so there's a provider per desktop:
-//! the gnome-shell extension on GNOME, a KWin script on KDE Plasma, and
-//! the compositor's IPC socket on sway, niri and Hyprland. Elsewhere,
+//! the gnome-shell extension on GNOME, a KWin script on KDE Plasma, the
+//! compositor's IPC socket on sway, niri and Hyprland, and COSMIC's
+//! toplevel-info and toplevel-management on COSMIC. Elsewhere,
 //! wlr-foreign-toplevel-management or ext-foreign-toplevel-list lists
 //! windows, without geometry. Each reports a window as a dict with the
 //! same fields (see `windows` in the CLI help), leaving out what its
@@ -33,7 +34,9 @@ pub(crate) enum Windows {
     /// KWin, through a script (see `kwin`).
     Kwin(crate::kwin::Kwin),
     /// wlr-foreign-toplevel-management (titles, app ids, states, focus) or
-    /// ext-foreign-toplevel-list (titles and app ids only): no geometry.
+    /// ext-foreign-toplevel-list (titles and app ids only): no geometry,
+    /// unless COSMIC's toplevel-info and toplevel-management add it
+    /// (with state and focus) to the ext handles.
     Toplevels(Arc<Wayland>),
     /// No provider: why.
     Unavailable(String),
@@ -109,6 +112,9 @@ impl Windows {
             Windows::Toplevels(w) if w.globals().foreign_toplevel.is_some() => {
                 "wlr-foreign-toplevel-management".into()
             }
+            Windows::Toplevels(w) if w.globals().cosmic_info.is_some() => {
+                "ext-foreign-toplevel-list with COSMIC's toplevel info".into()
+            }
             Windows::Toplevels(_) => "ext-foreign-toplevel-list".into(),
             Windows::Kwin(_) => "KWin".into(),
             Windows::Unavailable(why) => format!("nowhere: {why}"),
@@ -177,13 +183,20 @@ impl Windows {
                     .seat
                     .as_ref()
                     .ok_or_else(|| anyhow!("the compositor has no seat"))?;
-                let handle = toplevel.handle.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "this compositor offers no standard way to focus another window \
-                         (ext-foreign-toplevel-list only lists them)"
-                    )
-                })?;
-                handle.activate(seat);
+                match (
+                    &toplevel.handle,
+                    &toplevel.cosmic,
+                    &wayland.globals().cosmic_manager,
+                ) {
+                    (Some(handle), _, _) => handle.activate(seat),
+                    (None, Some(cosmic), Some(manager)) => manager.activate(cosmic, seat),
+                    _ => {
+                        return Err(anyhow!(
+                            "this compositor offers no way to focus another window \
+                             (ext-foreign-toplevel-list only lists them)"
+                        ));
+                    }
+                }
                 wayland.flush()
             }
             Windows::Hyprland(sock) => {
@@ -344,7 +357,7 @@ fn kwin_window(w: &serde_json::Value) -> Result<WindowDict> {
 /* ----- wlr-foreign-toplevel-management ----- */
 
 fn toplevel_window(t: &crate::wayland::Toplevel) -> Result<WindowDict> {
-    dict(vec![
+    let mut fields = vec![
         ("id", Value::U64(t.id)),
         ("title", t.title.as_str().into()),
         ("app_id", t.app_id.as_str().into()),
@@ -354,7 +367,22 @@ fn toplevel_window(t: &crate::wayland::Toplevel) -> Result<WindowDict> {
         ("minimized", t.minimized.into()),
         ("maximized", t.maximized.into()),
         ("fullscreen", t.fullscreen.into()),
-    ])
+    ];
+    // Where the compositor says (COSMIC); its geometry is the window's,
+    // with no frame of its own.
+    if let Some((x, y, w, h)) = t.rect {
+        fields.extend([
+            ("frame_x", Value::I32(x)),
+            ("frame_y", Value::I32(y)),
+            ("frame_w", Value::I32(w)),
+            ("frame_h", Value::I32(h)),
+            ("client_x", Value::I32(x)),
+            ("client_y", Value::I32(y)),
+            ("client_w", Value::I32(w)),
+            ("client_h", Value::I32(h)),
+        ]);
+    }
+    dict(fields)
 }
 
 /* ----- sway ----- */

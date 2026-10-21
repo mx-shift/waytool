@@ -14,6 +14,14 @@
 //! are sent with `flush`.
 
 use std::os::fd::AsFd;
+
+use cosmic_protocols::toplevel_info::v1::client::{
+    zcosmic_toplevel_handle_v1::{self, ZcosmicToplevelHandleV1},
+    zcosmic_toplevel_info_v1::{self, ZcosmicToplevelInfoV1},
+};
+use cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::{
+    self, ZcosmicToplevelManagerV1,
+};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
@@ -67,6 +75,10 @@ pub(crate) struct Globals {
     pub screencopy: Option<ZwlrScreencopyManagerV1>,
     pub foreign_toplevel: Option<ZwlrForeignToplevelManagerV1>,
     pub toplevel_list: Option<ExtForeignToplevelListV1>,
+    /// COSMIC's extensions to the ext list: state and geometry (version
+    /// 2 and up), and activation.
+    pub cosmic_info: Option<ZcosmicToplevelInfoV1>,
+    pub cosmic_manager: Option<ZcosmicToplevelManagerV1>,
 }
 
 /// A window as wlr-foreign-toplevel-management or ext-foreign-toplevel-
@@ -75,9 +87,13 @@ pub(crate) struct Globals {
 #[derive(Clone)]
 pub(crate) struct Toplevel {
     pub id: u64,
-    /// For activating it: wlr-foreign-toplevel-management only, as the
-    /// ext list just lists.
+    /// For activating it: wlr-foreign-toplevel-management's handle, or
+    /// COSMIC's (the ext list alone just lists).
     pub handle: Option<ZwlrForeignToplevelHandleV1>,
+    pub cosmic: Option<ZcosmicToplevelHandleV1>,
+    /// Frame rect in global logical coordinates, where the compositor
+    /// says (COSMIC).
+    pub rect: Option<(i32, i32, i32, i32)>,
     pub title: String,
     pub app_id: String,
     /// Connector names of the outputs it's on.
@@ -250,6 +266,15 @@ impl Wayland {
     }
 }
 
+/// What COSMIC adds to a listed toplevel, before it's mapped to names
+/// and global coordinates.
+#[derive(Default)]
+struct Listed {
+    outputs: Vec<wl_output::WlOutput>,
+    /// Position and size relative to an output.
+    geometry: Option<(wl_output::WlOutput, i32, i32, i32, i32)>,
+}
+
 #[derive(Default)]
 struct Output {
     /// The registry name of its wl_output global.
@@ -282,8 +307,9 @@ pub(crate) struct State {
     )>,
     next_toplevel: u64,
     toplevels_changed: bool,
-    /// ext-foreign-toplevel-list's windows by handle.
-    listed: Vec<(ExtForeignToplevelHandleV1, Toplevel)>,
+    /// ext-foreign-toplevel-list's windows by handle, with (from COSMIC)
+    /// the outputs each is on and its geometry relative to one.
+    listed: Vec<(ExtForeignToplevelHandleV1, Toplevel, Listed)>,
     listed_changed: bool,
     keymap_changed: Option<String>,
     changes: tokio::sync::watch::Sender<u64>,
@@ -361,8 +387,28 @@ impl State {
             self.shared.lock().unwrap().toplevels = toplevels;
         }
         if std::mem::take(&mut self.listed_changed) {
-            self.shared.lock().unwrap().listed =
-                self.listed.iter().map(|(_, t)| t.clone()).collect();
+            let output =
+                |wl: &wl_output::WlOutput| self.outputs.iter().find(|o| o.wl.as_ref() == Some(wl));
+            let listed = self
+                .listed
+                .iter()
+                .map(|(_, t, extra)| Toplevel {
+                    outputs: extra
+                        .outputs
+                        .iter()
+                        .filter_map(|wl| output(wl).map(|o| o.name.clone()))
+                        .collect(),
+                    // COSMIC gives the geometry relative to an output, in
+                    // logical coordinates: offset it by the output's place
+                    // in the layout.
+                    rect: extra.geometry.as_ref().and_then(|(wl, x, y, w, h)| {
+                        let (ox, oy) = output(wl)?.position?;
+                        Some((ox + x, oy + y, *w, *h))
+                    }),
+                    ..t.clone()
+                })
+                .collect();
+            self.shared.lock().unwrap().listed = listed;
         }
         if let Some(keymap) = self.keymap_changed.take() {
             self.shared.lock().unwrap().keymap = Some(keymap);
@@ -441,6 +487,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     }
                     "zwlr_screencopy_manager_v1" => {
                         g.screencopy = Some(registry.bind(name, version.min(3), qh, ()))
+                    }
+                    "zcosmic_toplevel_info_v1" if version >= 2 => {
+                        g.cosmic_info = Some(registry.bind(name, version.min(3), qh, ()))
+                    }
+                    "zcosmic_toplevel_manager_v1" => {
+                        g.cosmic_manager = Some(registry.bind(name, version.min(4), qh, ()))
                     }
                     "ext_foreign_toplevel_list_v1" => {
                         g.toplevel_list = Some(registry.bind(name, 1, qh, ()))
@@ -587,6 +639,8 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
             let entry = Toplevel {
                 id: state.next_toplevel,
                 handle: Some(toplevel.clone()),
+                cosmic: None,
+                rect: None,
                 title: String::new(),
                 app_id: String::new(),
                 outputs: Vec::new(),
@@ -653,13 +707,19 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for State {
         event: ext_foreign_toplevel_list_v1::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         if let ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } = event {
             state.next_toplevel += 1;
             let entry = Toplevel {
                 id: state.next_toplevel,
                 handle: None,
+                cosmic: state
+                    .globals
+                    .cosmic_info
+                    .as_ref()
+                    .map(|info| info.get_cosmic_toplevel(&toplevel, qh, state.next_toplevel)),
+                rect: None,
                 title: String::new(),
                 app_id: String::new(),
                 outputs: Vec::new(),
@@ -668,7 +728,7 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for State {
                 activated: false,
                 fullscreen: false,
             };
-            state.listed.push((toplevel, entry));
+            state.listed.push((toplevel, entry, Listed::default()));
         }
     }
 
@@ -687,7 +747,7 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         use ext_foreign_toplevel_handle_v1::Event;
-        let Some(i) = state.listed.iter().position(|(h, _)| h == handle) else {
+        let Some(i) = state.listed.iter().position(|(h, _, _)| h == handle) else {
             return;
         };
         let t = &mut state.listed[i].1;
@@ -696,11 +756,91 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
             Event::AppId { app_id } => t.app_id = app_id,
             Event::Done => state.listed_changed = true,
             Event::Closed => {
-                state.listed.remove(i).0.destroy();
+                let (handle, t, _) = state.listed.remove(i);
+                if let Some(cosmic) = t.cosmic {
+                    cosmic.destroy();
+                }
+                handle.destroy();
                 state.listed_changed = true;
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<ZcosmicToplevelHandleV1, u64> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZcosmicToplevelHandleV1,
+        event: zcosmic_toplevel_handle_v1::Event,
+        id: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zcosmic_toplevel_handle_v1::Event;
+        let Some((_, t, extra)) = state.listed.iter_mut().find(|(_, t, _)| t.id == *id) else {
+            return;
+        };
+        match event {
+            Event::State { state: s } => {
+                let states: Vec<u32> = s
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_ne_bytes(*c))
+                    .collect();
+                t.maximized = states.contains(&0);
+                t.minimized = states.contains(&1);
+                t.activated = states.contains(&2);
+                t.fullscreen = states.contains(&3);
+            }
+            Event::OutputEnter { output } => extra.outputs.push(output),
+            Event::OutputLeave { output } => {
+                extra.outputs.retain(|o| o != &output);
+                if extra.geometry.as_ref().is_some_and(|(o, ..)| o == &output) {
+                    extra.geometry = None;
+                }
+            }
+            Event::Geometry {
+                output,
+                x,
+                y,
+                width,
+                height,
+            } => extra.geometry = Some((output, x, y, width, height)),
+            _ => return,
+        }
+        state.listed_changed = true;
+    }
+}
+
+impl Dispatch<ZcosmicToplevelInfoV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZcosmicToplevelInfoV1,
+        _: zcosmic_toplevel_info_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+
+    // Only version 1 announces toplevels itself (we bind version 2 or
+    // later and ask per ext handle instead); id 0 matches no window.
+    wayland_client::event_created_child!(State, ZcosmicToplevelInfoV1, [
+        zcosmic_toplevel_info_v1::EVT_TOPLEVEL_OPCODE => (ZcosmicToplevelHandleV1, 0u64),
+    ]);
+}
+
+impl Dispatch<ZcosmicToplevelManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZcosmicToplevelManagerV1,
+        _: zcosmic_toplevel_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 
