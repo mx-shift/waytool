@@ -17,6 +17,8 @@
 //! - The user runs `waytool daemon` in a terminal or as a systemd
 //!   user unit. Each start shows the consent dialog; commands reuse the
 //!   session until the daemon exits.
+//! - A display change that ends a shared monitor's stream needs a new
+//!   session, and so new consent (see `spawn_display_watcher`).
 //! - Nothing is kept on disk between runs.
 
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -58,8 +60,10 @@ fn sd_notify(msg: &str) {
 
 /// State shared by every client connection.
 pub(crate) struct Daemon {
-    /// The portal session.
-    portal: Arc<Portal>,
+    /// The current portal session, swapped wholesale on re-establish.
+    /// Callers take a snapshot (`portal()`) and use that for the whole
+    /// request, so nothing holds this lock across an await.
+    portal: std::sync::Mutex<Arc<Portal>>,
     /// Serializes input requests, so one client's keystrokes and clicks
     /// never interleave with another's. Read-only requests and captures
     /// don't take it, so a long `type` doesn't block them.
@@ -70,19 +74,37 @@ pub(crate) struct Daemon {
     capture: Mutex<()>,
     /// Set once shutdown starts, so the session watcher doesn't race it.
     stopping: AtomicBool,
+    /// Set while a replacement session is being established, which can
+    /// sit on a consent dialog indefinitely.
+    reestablishing: AtomicBool,
     /// Asks the main loop to shut down, the same way SIGTERM does.
     shutdown: Notify,
+    /// The session bus.
+    bus: zbus::Connection,
     /// The monitor layout, from the daemon's own Wayland connection.
     outputs: Arc<crate::wayland::Wayland>,
 }
 
 impl Daemon {
     fn portal(&self) -> Arc<Portal> {
-        self.portal.clone()
+        self.portal.lock().unwrap().clone()
+    }
+
+    /// Fail while a re-establish is waiting on consent: the session in
+    /// place is about to be replaced, and its streams may already be
+    /// gone.
+    fn check_ready(&self) -> Result<()> {
+        if self.reestablishing.load(Ordering::SeqCst) {
+            return Err(anyhow!(
+                "the display changed; waiting for screen-sharing consent for the new layout"
+            ));
+        }
+        Ok(())
     }
 
     /// Take the input lock and the portal to send input through.
     async fn input(&self) -> Result<(MutexGuard<'_, ()>, Arc<Portal>)> {
+        self.check_ready()?;
         let guard = self.input.lock().await;
         Ok((guard, self.portal()))
     }
@@ -90,7 +112,11 @@ impl Daemon {
 
 /// Watch a portal session and shut the daemon down when it ends: the
 /// portal closed it (the user stopped sharing, or revoked consent), or
-/// its libei connection was lost, so input can no longer be sent.
+/// its libei connection was lost, so input can no longer be sent. Stops
+/// watching, and lets go of the session, when a re-establish retires it.
+///
+/// A Closed signal never answers our own Close call (portal Session
+/// docs), so closing a retired session doesn't trip this.
 fn spawn_session_watcher(portal: &Arc<Portal>, daemon: Arc<Daemon>) {
     let portal = portal.clone();
     tokio::spawn(async move {
@@ -105,6 +131,10 @@ fn spawn_session_watcher(portal: &Arc<Portal>, daemon: Arc<Daemon>) {
             }
         };
         let why = tokio::select! {
+            // Retirement first: closing a retired session also ends its
+            // libei connection, and that mustn't read as a loss.
+            biased;
+            _ = portal.retired.notified() => return,
             _ = closed.next() => "portal session closed (screen sharing stopped or consent revoked)",
             _ = portal.input_lost() => "lost the libei input connection",
         };
@@ -113,6 +143,135 @@ fn spawn_session_watcher(portal: &Arc<Portal>, daemon: Arc<Daemon>) {
         }
         eprintln!("waytool: {why}; shutting down");
         daemon.shutdown.notify_one();
+    });
+}
+
+/// Re-establish the portal session after a display reconfiguration. The
+/// streams of the old layout may be gone, so stand up a completely new
+/// session and swap it in. That shows the consent dialog again: GNOME
+/// doesn't restore screencast streams from a token. Requests fail
+/// meanwhile instead of using a session that's going away; the swap
+/// itself waits for requests in flight. If the new session can't be set
+/// up, the daemon shuts down rather than carry on with streams that may
+/// no longer exist.
+async fn reestablish(daemon: &Arc<Daemon>) {
+    daemon.reestablishing.store(true, Ordering::SeqCst);
+    let established = Portal::establish(&daemon.bus, &daemon.outputs).await;
+    let result = match established {
+        Ok(portal) => {
+            let portal = Arc::new(portal);
+            let _input = daemon.input.lock().await;
+            let _capture = daemon.capture.lock().await;
+            let old = std::mem::replace(&mut *daemon.portal.lock().unwrap(), portal.clone());
+            spawn_session_watcher(&portal, daemon.clone());
+            old.retired.notify_one();
+            if let Err(e) = old.session.close().await {
+                eprintln!("waytool: closing the replaced session failed: {e:#}");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    };
+    daemon.reestablishing.store(false, Ordering::SeqCst);
+    match result {
+        Ok(()) => eprintln!("waytool: portal session re-established"),
+        Err(e) => {
+            eprintln!("waytool: re-establishing the session failed ({e:#}); shutting down");
+            daemon.shutdown.notify_one();
+        }
+    }
+}
+
+/// Whether the session still fits the display after a reconfiguration:
+/// the layout (monitor names, rects and scales, and GNOME's layout
+/// mode) is what it was when the session started, and every stream is
+/// still there. A change such as a new refresh rate keeps both, and
+/// needs no new consent.
+async fn session_survives(daemon: &Daemon) -> Result<bool> {
+    let portal = daemon.portal();
+    if daemon.outputs.monitors() != portal.monitors
+        || crate::display::physical_layout(&daemon.bus)
+            .await
+            .unwrap_or(false)
+            != portal.physical_layout
+    {
+        return Ok(false);
+    }
+    portal.streams_alive().await
+}
+
+/// Say why a screen-sharing dialog is about to appear. A consent prompt
+/// nobody asked for, after a display change, otherwise looks like any
+/// other app asking — and teaches people to click "Share" without
+/// reading. Best-effort: no notification server, no notification.
+async fn notify_reconsent(bus: &zbus::Connection) {
+    let hints = std::collections::HashMap::<&str, zvariant::Value>::new();
+    let sent = bus
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &(
+                "waytool",
+                0u32,
+                "preferences-desktop-remote-desktop-symbolic",
+                "Display changed",
+                "waytool is asking to share the screen again for the new \
+                 monitor layout. Approve the dialog to keep it working.",
+                Vec::<&str>::new(),
+                hints,
+                -1i32,
+            ),
+        )
+        .await;
+    if let Err(e) = sent {
+        eprintln!("waytool: couldn't post a notification: {e}");
+    }
+}
+
+/// Watch the monitor layout (wl_output and xdg-output, see `wayland`)
+/// and re-establish the portal session when a change leaves it out of
+/// date (see `session_survives`), so the daemon survives a resolution,
+/// scale or layout change instead of serving stale streams.
+fn spawn_display_watcher(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        let mut changes = daemon.outputs.changes();
+        loop {
+            // Block until the first change of a burst.
+            if changes.changed().await.is_err() {
+                return; // the Wayland connection is gone
+            }
+            // Debounce: one reconfiguration changes several outputs in
+            // quick succession, and each re-establish may pop a consent
+            // dialog — coalesce until 2s of quiet before acting.
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), changes.changed())
+                    .await
+                {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => return,
+                    Err(_) => break,
+                }
+            }
+            match session_survives(&daemon).await {
+                Ok(true) => {
+                    eprintln!(
+                        "waytool: display reconfigured, but the layout and every \
+                         shared monitor's stream are unchanged; keeping the session"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("waytool: couldn't check the session ({e:#})"),
+            }
+            eprintln!(
+                "waytool: display reconfiguration detected; re-establishing \
+                 the portal session, which asks for screen-sharing consent again"
+            );
+            notify_reconsent(&daemon.bus).await;
+            reestablish(&daemon).await;
+        }
     });
 }
 
@@ -246,7 +405,7 @@ pub async fn run_daemon() -> Result<()> {
     eprintln!("waytool: establishing portal session (consent prompt may appear)...");
     sd_notify("STATUS=Waiting for screen-sharing consent");
     let portal = tokio::select! {
-        portal = Portal::establish(&bus) => Arc::new(portal?),
+        portal = Portal::establish(&bus, &outputs) => Arc::new(portal?),
         // Stopping the unit while the consent dialog is up.
         _ = sigterm.recv() => return Ok(()),
         _ = sigint.recv() => return Ok(()),
@@ -257,16 +416,20 @@ pub async fn run_daemon() -> Result<()> {
     );
 
     let daemon = Arc::new(Daemon {
-        portal: portal.clone(),
+        portal: std::sync::Mutex::new(portal.clone()),
         input: Mutex::new(()),
         capture: Mutex::new(()),
         stopping: AtomicBool::new(false),
+        reestablishing: AtomicBool::new(false),
         shutdown: Notify::new(),
+        bus,
         outputs,
     });
 
-    // Exit the daemon if the portal session ends out from under us.
+    // Exit the daemon if the portal session ends out from under us;
+    // re-establish it if the display is reconfigured.
     spawn_session_watcher(&portal, daemon.clone());
+    spawn_display_watcher(daemon.clone());
 
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     eprintln!("waytool: listening on {}", sock.display());
@@ -643,6 +806,7 @@ impl Service {
     /// never writes files on a caller's behalf.
     async fn screenshot(&self) -> Result<Vec<Frame>, Error> {
         let _call = self.admit()?;
+        self.daemon.check_ready()?;
         let _capture = self.daemon.capture.lock().await;
         let portal = self.daemon.portal();
         let node_ids: Vec<u32> = portal.streams().iter().map(|s| s.node_id).collect();

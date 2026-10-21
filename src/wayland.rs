@@ -5,7 +5,7 @@
 //! same everywhere, unlike the compositors' own layout APIs.
 //!
 //! The connection is read on a thread of its own, which keeps the
-//! layout current.
+//! layout current and tells the daemon when it changes.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +35,7 @@ pub(crate) struct Monitor {
 /// The layout, kept current by the connection's thread.
 pub(crate) struct Wayland {
     monitors: Arc<Mutex<Vec<Monitor>>>,
+    changes: tokio::sync::watch::Receiver<u64>,
 }
 
 impl Wayland {
@@ -57,27 +58,40 @@ impl Wayland {
         }
 
         let monitors = Arc::new(Mutex::new(state.monitors()));
+        let (tx, changes) = tokio::sync::watch::channel(0u64);
         let thread_monitors = monitors.clone();
         std::thread::Builder::new()
             .name("wayland".into())
             .spawn(move || {
+                let mut generation = 0;
                 loop {
                     if let Err(e) = queue.blocking_dispatch(&mut state) {
                         eprintln!("waytool: Wayland connection lost: {e}");
                         return;
                     }
                     if std::mem::take(&mut state.changed) {
-                        *thread_monitors.lock().unwrap() = state.monitors();
+                        let now = state.monitors();
+                        let mut cur = thread_monitors.lock().unwrap();
+                        if *cur != now {
+                            *cur = now;
+                            generation += 1;
+                            let _ = tx.send(generation);
+                        }
                     }
                 }
             })
             .context("start the Wayland thread")?;
-        Ok(Arc::new(Wayland { monitors }))
+        Ok(Arc::new(Wayland { monitors, changes }))
     }
 
     /// The current layout, in the compositor's announcement order.
     pub(crate) fn monitors(&self) -> Vec<Monitor> {
         self.monitors.lock().unwrap().clone()
+    }
+
+    /// A receiver that changes whenever the layout does.
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.clone()
     }
 }
 

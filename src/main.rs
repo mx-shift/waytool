@@ -48,7 +48,8 @@ enum Cmd {
     /* ----- meta / lifecycle ----- */
     /// Run the daemon that holds the input and capture session.
     ///
-    /// Each start asks for screen-sharing consent. Other commands reuse
+    /// Each start asks for screen-sharing consent, and so does a display
+    /// change that ends a shared monitor's stream. Other commands reuse
     /// the session until the daemon exits. Stop it with Ctrl-C, or from
     /// the desktop's screen-sharing indicator.
     Daemon,

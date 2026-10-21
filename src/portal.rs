@@ -48,7 +48,9 @@ impl StreamInfo {
 }
 
 /// One established portal session: the RemoteDesktop + ScreenCast
-/// session, its libei connection, and the streams it started.
+/// session, its libei connection, and the streams it started. Replaced wholesale when the display is reconfigured;
+/// anything still holding the old one keeps a consistent (if dead) view
+/// instead of a mix.
 pub(crate) struct Portal {
     pub(crate) session: Session<RemoteDesktop>,
     eis: Eis,
@@ -57,15 +59,25 @@ pub(crate) struct Portal {
     sc: Screencast,
     /// Each portal stream, in portal order.
     streams: Vec<StreamInfo>,
+    /// Notified when a re-establish replaces this session, so its
+    /// watcher stops.
+    pub(crate) retired: tokio::sync::Notify,
+    /// The monitor layout when the session started.
+    pub(crate) monitors: Vec<crate::wayland::Monitor>,
     /// Whether GNOME's physical layout mode was on (see `display`).
     pub(crate) physical_layout: bool,
 }
 
 impl Portal {
     /// Establish a fresh portal session and connect its input. May
-    /// surface a consent dialog.
-    pub(crate) async fn establish(bus: &zbus::Connection) -> Result<Portal> {
+    /// surface a consent dialog. Used at startup and again on every
+    /// display reconfiguration.
+    pub(crate) async fn establish(
+        bus: &zbus::Connection,
+        outputs: &crate::wayland::Wayland,
+    ) -> Result<Portal> {
         let (rd, sc, session, streams) = establish_session().await?;
+        let monitors = outputs.monitors();
         let physical_layout = crate::display::physical_layout(bus).await.unwrap_or(false);
         let eis = match connect_input(&rd, &session).await {
             Ok(eis) => eis,
@@ -81,6 +93,8 @@ impl Portal {
             eis,
             sc,
             streams,
+            retired: tokio::sync::Notify::new(),
+            monitors,
             physical_layout,
         })
     }
@@ -93,6 +107,16 @@ impl Portal {
     /// The session's streams.
     pub(crate) fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    /// Whether every stream's PipeWire node still exists. A display
+    /// change ends the streams of monitors it changed.
+    pub(crate) async fn streams_alive(&self) -> Result<bool> {
+        let fd = self.pipewire_fd().await?;
+        let node_ids: Vec<u32> = self.streams().iter().map(|s| s.node_id).collect();
+        tokio::task::spawn_blocking(move || crate::capture::nodes_exist(fd, &node_ids))
+            .await
+            .context("node check task")?
     }
 
     /// A new PipeWire connection for one capture.

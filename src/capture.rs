@@ -313,6 +313,18 @@ pub(crate) fn pipewire_capture_frames(fd: OwnedFd, node_ids: &[u32]) -> Result<V
         .collect()
 }
 
+/// Whether every node in `node_ids` still exists, as seen over `fd` (a
+/// connection from OpenPipeWireRemote). Blocking, like the capture.
+pub(crate) fn nodes_exist(fd: OwnedFd, node_ids: &[u32]) -> Result<bool> {
+    use pipewire as pw;
+    pw::init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw main_loop")?;
+    let context = pw::context::ContextRc::new(&mainloop, None).context("pw context")?;
+    let core = context.connect_fd_rc(fd, None).context("pw connect_fd")?;
+    let nodes = list_nodes(&mainloop, &core)?;
+    Ok(node_ids.iter().all(|id| nodes.contains_key(id)))
+}
+
 /// The `object.serial` of each node in `node_ids`. The portal's
 /// connection lists only the session's own nodes, so a node missing
 /// here belongs to a stream that has ended.
