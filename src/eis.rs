@@ -51,6 +51,7 @@ enum Which {
     Pointer,
     Absolute,
     Keyboard,
+    Text,
 }
 
 impl Which {
@@ -59,6 +60,7 @@ impl Which {
             Which::Pointer => "pointer",
             Which::Absolute => "absolute pointer",
             Which::Keyboard => "keyboard",
+            Which::Text => "text",
         }
     }
 }
@@ -70,6 +72,9 @@ struct State {
     /// Absolute motion, with one region per stream.
     absolute: Option<Slot>,
     keyboard: Option<Slot>,
+    /// Text input (libei 1.6's ei_text), on a device of its own; a
+    /// keyboard device may offer it too.
+    text: Option<Slot>,
     /// The keyboard's keymap, one entry per layout.
     layouts: Vec<Layout>,
     /// The keys we hold on the keyboard.
@@ -97,14 +102,20 @@ impl State {
             Which::Pointer => self.pointer.as_mut(),
             Which::Absolute => self.absolute.as_mut(),
             Which::Keyboard => self.keyboard.as_mut(),
+            Which::Text => self.text.as_mut(),
         }
     }
 
     fn slot_for(&mut self, device: &Device) -> Option<&mut Slot> {
-        [&mut self.pointer, &mut self.absolute, &mut self.keyboard]
-            .into_iter()
-            .flatten()
-            .find(|s| &s.device == device)
+        [
+            &mut self.pointer,
+            &mut self.absolute,
+            &mut self.keyboard,
+            &mut self.text,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|s| &s.device == device)
     }
 
     /// The device that sends buttons: the relative pointer, or failing
@@ -120,6 +131,21 @@ impl State {
                 .is_some_and(|s| s.device.has_capability(DeviceCapability::Button))
         })
         .map(|(which, _)| which)
+    }
+
+    /// The device that takes text, if any.
+    fn text_device(&self) -> Option<Which> {
+        let offers = |s: &Option<Slot>| {
+            s.as_ref()
+                .is_some_and(|s| s.device.has_capability(DeviceCapability::Text))
+        };
+        if offers(&self.keyboard) {
+            Some(Which::Keyboard)
+        } else if offers(&self.text) {
+            Some(Which::Text)
+        } else {
+            None
+        }
     }
 
     /// The current layout, or why there's none to type with.
@@ -315,6 +341,23 @@ impl Eis {
                 keyboard.key(code, state);
             }
         })
+    }
+
+    /// Whether the compositor takes text (libei's ei_text), which types
+    /// characters the keyboard layout lacks.
+    pub(crate) fn has_text(&self) -> bool {
+        self.state.lock().unwrap().text_device().is_some()
+    }
+
+    /// Type `text` as text (ei_text's utf8): the compositor commits it to
+    /// the focused window.
+    pub(crate) fn type_utf8(&self, text: &str) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let which = st
+            .text_device()
+            .ok_or_else(|| anyhow!("the compositor doesn't take text through libei"))?;
+        let keep = which == Which::Keyboard && !st.keys.is_empty();
+        self.emit::<ei::Text>(&mut st, which, keep, |t| t.utf8(text))
     }
 
     /// Press or release an evdev pointer button.
@@ -520,7 +563,8 @@ fn handle_event(st: &mut State, event: EiEvent) {
                 | DeviceCapability::PointerAbsolute
                 | DeviceCapability::Keyboard
                 | DeviceCapability::Button
-                | DeviceCapability::Scroll,
+                | DeviceCapability::Scroll
+                | DeviceCapability::Text,
         ),
         EiEvent::DeviceAdded(e) => {
             let device = e.device;
@@ -545,6 +589,8 @@ fn handle_event(st: &mut State, event: EiEvent) {
                 // keymap changes) holds nothing.
                 st.keys.clear();
                 st.keyboard = slot;
+            } else if device.has_capability(DeviceCapability::Text) {
+                st.text = slot;
             } else if device.has_capability(DeviceCapability::PointerAbsolute) {
                 st.absolute = slot;
             } else if device.has_capability(DeviceCapability::Pointer) {
@@ -552,7 +598,12 @@ fn handle_event(st: &mut State, event: EiEvent) {
             }
         }
         EiEvent::DeviceRemoved(e) => {
-            for slot in [&mut st.pointer, &mut st.absolute, &mut st.keyboard] {
+            for slot in [
+                &mut st.pointer,
+                &mut st.absolute,
+                &mut st.keyboard,
+                &mut st.text,
+            ] {
                 if slot.as_ref().is_some_and(|s| s.device == e.device) {
                     *slot = None;
                 }

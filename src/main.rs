@@ -128,8 +128,9 @@ enum Cmd {
     /// A newline or tab types Return or Tab, and the modifiers each
     /// character's level needs are pressed with it; use `key-chord` for
     /// shortcuts. A character that isn't on the keyboard layout (an emoji,
-    /// say) types too: as a key of its own under the Wayland backend, and
-    /// on GNOME as text through the gnome-shell extension, which
+    /// say) types too: as a key of its own under the Wayland backend, as
+    /// libei text where the compositor takes it (COSMIC, KDE Plasma 6.8+),
+    /// and on GNOME as text through the gnome-shell extension, which
     /// reaches windows that take text input (GTK, Qt 6, Firefox) but not
     /// X11 apps or emulators; there the whole string goes that way, to
     /// keep its order. A string that can't be typed is rejected before

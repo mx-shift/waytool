@@ -115,6 +115,16 @@ impl Portal {
         self.eis.has_keysym(keysym)
     }
 
+    /// Whether the compositor takes text through libei (ei_text).
+    pub(crate) fn has_text(&self) -> bool {
+        self.eis.has_text()
+    }
+
+    /// Type `text` through libei's text capability.
+    pub(crate) fn type_utf8(&self, text: &str) -> Result<()> {
+        self.eis.type_utf8(text)
+    }
+
     /// Press or release the key for `keysym`.
     pub(crate) fn keysym(&self, keysym: u32, press: bool) -> Result<()> {
         self.eis.keysym(keysym, press)

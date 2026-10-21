@@ -151,6 +151,23 @@ impl Backend {
         }
     }
 
+    /// Whether characters the keyboard layout lacks can be typed as text
+    /// through the input connection itself (libei's ei_text). The
+    /// Wayland backend never needs to: its keymap takes any character.
+    pub(crate) fn has_text(&self) -> bool {
+        match self {
+            Backend::Portal(p) => p.has_text(),
+            Backend::Native(_) => false,
+        }
+    }
+
+    pub(crate) fn type_utf8(&self, text: &str) -> Result<()> {
+        match self {
+            Backend::Portal(p) => p.type_utf8(text),
+            Backend::Native(_) => Err(anyhow!("the Wayland backend types text as keys")),
+        }
+    }
+
     pub(crate) fn keysym(&self, keysym: u32, press: bool) -> Result<()> {
         match self {
             Backend::Portal(p) => p.keysym(keysym, press),

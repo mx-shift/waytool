@@ -642,6 +642,9 @@ enum Stroke {
     /// A control key (keysym, evdev keycode) sent through the extension,
     /// in order with commits.
     Forward(u32, u32),
+    /// A character typed as text on the input connection (libei's
+    /// ei_text), in order with the key presses on it.
+    InputText(char),
 }
 
 /// How long to wait for the focused window to accept text after
@@ -658,15 +661,18 @@ const TEXT_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// that's down is always released first.
 ///
 /// A character that isn't on the keyboard layout can't be sent as a key
-/// press at all. Those are committed as text through the gnome-shell
-/// extension, the way GNOME's on-screen keyboard types emoji; that
+/// press at all. Where the compositor takes text on the libei connection
+/// (ei_text, libei 1.6: COSMIC, KDE Plasma 6.8+), such characters go
+/// that way, between the key presses. Otherwise (GNOME) they're committed
+/// as text through the gnome-shell extension, the way GNOME's on-screen
+/// keyboard types emoji; that
 /// reaches windows that take text input (text-input-v3: GTK, Qt 6,
 /// Firefox) but not X11 apps, emulators or Chromium without its Wayland
 /// IME flag. Everything is checked before the first keystroke, so a
 /// string that can't be typed types nothing.
 ///
-/// Key presses from the keyboard device and commits don't arrive in the
-/// order they're sent: gnome-shell hands each key press to the input
+/// Through the extension, key presses from the keyboard device and
+/// commits don't arrive in the order they're sent: gnome-shell hands each key press to the input
 /// method's engine (IBus) and delivers it when the engine answers, while
 /// a commit is queued at once. So a string that needs a commit goes
 /// entirely through the extension — printable characters committed,
@@ -696,8 +702,21 @@ async fn type_text(
         }
         syms.push((ch, sym));
     }
+    // The compositor takes text on the input connection itself: keys stay
+    // keys, and only what the layout lacks goes as text, in one stream.
+    let input_text = keyless.is_some() && portal.has_text();
     let strokes: Vec<Stroke> = match keyless {
         None => syms.into_iter().map(|(_, sym)| Stroke::Key(sym)).collect(),
+        Some(_) if input_text => syms
+            .into_iter()
+            .map(|(ch, sym)| {
+                if portal.has_keysym(sym)? {
+                    Ok(Stroke::Key(sym))
+                } else {
+                    Ok(Stroke::InputText(ch))
+                }
+            })
+            .collect::<Result<_>>()?,
         Some(_) => syms
             .into_iter()
             .map(|(ch, sym)| {
@@ -711,12 +730,12 @@ async fn type_text(
             })
             .collect::<Result<_>>()?,
     };
-    if let Some(ch) = keyless {
-        // Only the GNOME extension can commit text.
+    if let Some(ch) = keyless.filter(|_| !input_text) {
+        // Only the GNOME extension can commit text otherwise.
         let Some(bus) = extension else {
             return Err(anyhow!(
                 "{ch:?} isn't on the keyboard layout, and this desktop offers no way to type \
-                 it as text — nothing was typed"
+                 it as text (KDE Plasma does from 6.8, through libei) — nothing was typed"
             ));
         };
         let deadline = tokio::time::Instant::now() + TEXT_FOCUS_TIMEOUT;
@@ -748,6 +767,10 @@ async fn type_text(
             Stroke::Text(ch) => commit_text(extension.expect("checked"), &ch.to_string()).await?,
             Stroke::Forward(sym, code) => {
                 forward_key(extension.expect("checked"), sym, code).await?
+            }
+            Stroke::InputText(ch) => {
+                portal.type_utf8(&ch.to_string())?;
+                true
             }
         };
         if !accepted {
