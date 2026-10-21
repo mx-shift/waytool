@@ -14,8 +14,8 @@ const EXT_OBJECT_PATH: &str = "/com/mxshift/Waytool";
 const EXT_INTERFACE: &str = "com.mxshift.Waytool";
 
 const EXT_NOT_FOUND_HINT: &str = "Is the waytool gnome-shell extension installed and enabled? \
-     GNOME also turns extensions off while the screen is locked. After installing, log \
-     out and back in so gnome-shell picks it up.";
+     GNOME also turns extensions off while the screen is locked. See the README; after \
+     installing, log out and back in so gnome-shell picks it up.";
 
 pub(crate) async fn ext_proxy(bus: &zbus::Connection) -> Result<zbus::Proxy<'static>> {
     zbus::Proxy::new(bus, EXT_BUS_NAME, EXT_OBJECT_PATH, EXT_INTERFACE)
