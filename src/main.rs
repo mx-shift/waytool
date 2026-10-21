@@ -21,6 +21,7 @@ mod eis;
 mod keys;
 mod portal;
 mod protocol;
+mod wayland;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -141,7 +142,7 @@ enum Cmd {
 
     /// Move the pointer to a global logical coordinate.
     ///
-    /// The compositor's layout: the space `streams` reports positions in.
+    /// The space `monitors` reports rects in.
     MoveGlobal {
         /// Global logical x.
         x: f64,
@@ -245,6 +246,15 @@ enum Cmd {
         /// Global logical y.
         y: f64,
     },
+
+    /* ----- monitors ----- */
+    /// List monitors: index, connector name (e.g. DP-1), description, rect in global logical coordinates, scale.
+    ///
+    /// Read from the compositor's Wayland outputs (wl_output and
+    /// xdg-output), so it works on every desktop. The scale is physical
+    /// pixels per logical pixel: a screenshot of the monitor is its size
+    /// times this.
+    Monitors,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -324,9 +334,31 @@ async fn call(cmd: Cmd) -> Result<()> {
         Cmd::StreamAt { x, y } => {
             println!("{}", d.stream_at(x, y).await.map_err(protocol::describe)?);
         }
+        Cmd::Monitors => {
+            let monitors = d.monitors().await.map_err(protocol::describe)?;
+            println!("{}", fmt_dicts("monitor", &monitors));
+        }
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())
+}
+
+/// Print dicts as `key<TAB>value` lines, sorted by key, under
+/// a `--- label[i] ---` header per dict.
+fn fmt_dicts(label: &str, dicts: &[protocol::WindowDict]) -> String {
+    if dicts.is_empty() {
+        return format!("no {label}");
+    }
+    let mut out = String::new();
+    for (i, d) in dicts.iter().enumerate() {
+        out.push_str(&format!("--- {label}[{i}] ---\n"));
+        let mut keys: Vec<&String> = d.keys().collect();
+        keys.sort();
+        for k in keys {
+            out.push_str(&format!("{k}\t{}\n", protocol::render_value(&d[k])));
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// Where `screenshot OUT` writes `n` frames: exactly `OUT` for one,

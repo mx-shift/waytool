@@ -77,6 +77,33 @@ pub struct Frame {
     pub rgba: zvariant::OwnedFd,
 }
 
+/// A monitor's fields: `a{sv}` with keys like `name`, `x`, `scale`.
+pub type WindowDict = std::collections::HashMap<String, zvariant::OwnedValue>;
+
+/// Render a dict value as text. zvariant doesn't implement Display on
+/// OwnedValue/Value so this dispatches on the common scalar variants
+/// explicitly and falls back to Debug for the rest (arrays, dicts,
+/// structs).
+pub fn render_value(v: &zvariant::OwnedValue) -> String {
+    use zvariant::Value;
+    let inner: &Value = v;
+    match inner {
+        Value::Str(s) => s.to_string(),
+        Value::U64(n) => n.to_string(),
+        Value::U32(n) => n.to_string(),
+        Value::U16(n) => n.to_string(),
+        Value::U8(n) => n.to_string(),
+        Value::I64(n) => n.to_string(),
+        Value::I32(n) => n.to_string(),
+        Value::I16(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::F64(f) => format!("{f}"),
+        Value::Signature(s) => s.to_string(),
+        Value::ObjectPath(p) => p.to_string(),
+        _ => format!("{inner:?}"),
+    }
+}
+
 /// Client side of the daemon interface. The `default_service` is
 /// required by the proxy machinery but means nothing on a
 /// peer-to-peer connection; the daemon ignores the destination.
@@ -133,6 +160,9 @@ pub trait Daemon {
     fn stream_at(&self, x: f64, y: f64) -> Result<u32, Error>;
     /// Capture one frame per stream, in stream index order.
     fn screenshot(&self) -> Result<Vec<Frame>, Error>;
+
+    /// Monitors with geometry and scale.
+    fn monitors(&self) -> Result<Vec<WindowDict>, Error>;
 }
 
 /// Connect to the running daemon.

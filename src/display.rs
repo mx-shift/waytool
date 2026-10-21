@@ -1,6 +1,7 @@
 //! GNOME's layout mode, from mutter's org.gnome.Mutter.DisplayConfig
-//! interface (documented in its D-Bus XML), which decides how a
-//! screenshot pixel maps to a logical position. GNOME-only: elsewhere the call fails and the default, logical, is
+//! interface (documented in its D-Bus XML) — the one thing about the
+//! layout the Wayland protocols don't say (see `wayland` for the rest).
+//! GNOME-only: elsewhere the call fails and the default, logical, is
 //! assumed.
 
 use std::collections::HashMap;

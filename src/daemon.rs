@@ -31,7 +31,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::portal::Portal;
-use crate::protocol::{Error, Frame, StreamDesc};
+use crate::protocol::{Error, Frame, StreamDesc, WindowDict};
 
 /// Tell systemd about our state when run as a `Type=notify` unit
 /// (`READY=1`, `STATUS=...`). A no-op outside systemd. Readiness is
@@ -72,6 +72,8 @@ pub(crate) struct Daemon {
     stopping: AtomicBool,
     /// Asks the main loop to shut down, the same way SIGTERM does.
     shutdown: Notify,
+    /// The monitor layout, from the daemon's own Wayland connection.
+    outputs: Arc<crate::wayland::Wayland>,
 }
 
 impl Daemon {
@@ -240,6 +242,7 @@ pub async fn run_daemon() -> Result<()> {
     let bus = zbus::Connection::session()
         .await
         .context("connect to the session bus")?;
+    let outputs = crate::wayland::Wayland::connect()?;
     eprintln!("waytool: establishing portal session (consent prompt may appear)...");
     sd_notify("STATUS=Waiting for screen-sharing consent");
     let portal = tokio::select! {
@@ -259,6 +262,7 @@ pub async fn run_daemon() -> Result<()> {
         capture: Mutex::new(()),
         stopping: AtomicBool::new(false),
         shutdown: Notify::new(),
+        outputs,
     });
 
     // Exit the daemon if the portal session ends out from under us.
@@ -537,8 +541,8 @@ impl Service {
         Ok(())
     }
 
-    /// Absolute move to global logical coordinates, the space the portal
-    /// reports stream positions in.
+    /// Absolute move to global logical coordinates, the space monitor
+    /// rects are reported in.
     async fn move_global(&self, x: f64, y: f64) -> Result<(), Error> {
         let _call = self.admit()?;
         finite(&[x, y])?;
@@ -660,6 +664,36 @@ impl Service {
             })
             .collect::<Result<_>>()?;
         Ok(frames)
+    }
+
+    /// Monitors: index, connector name, description, rect in global
+    /// logical coordinates, and scale.
+    async fn monitors(&self) -> Result<Vec<WindowDict>, Error> {
+        let _call = self.admit()?;
+        let dict = |entries: Vec<(&str, zvariant::Value)>| -> Result<WindowDict, Error> {
+            entries
+                .into_iter()
+                .map(|(k, v)| Ok((k.to_owned(), v.try_to_owned().map_err(zbus::Error::from)?)))
+                .collect()
+        };
+        self.daemon
+            .outputs
+            .monitors()
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| {
+                dict(vec![
+                    ("index", (i as u32).into()),
+                    ("name", m.name.into()),
+                    ("description", m.description.into()),
+                    ("x", m.x.into()),
+                    ("y", m.y.into()),
+                    ("width", m.width.into()),
+                    ("height", m.height.into()),
+                    ("scale", m.scale.into()),
+                ])
+            })
+            .collect()
     }
 }
 
