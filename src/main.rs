@@ -48,8 +48,8 @@ use clap::{Parser, Subcommand};
                   screen capture protocols, which ask nothing.\n\
                   \n\
                   [windows]  Needs the desktop's window information: the waytool \
-                  gnome-shell extension on GNOME, or the compositor's IPC on sway and niri. \
-                  Without one these commands fail with an error saying so.\n\
+                  gnome-shell extension on GNOME, or the compositor's IPC on sway, niri and \
+                  Hyprland. Without one these commands fail with an error saying so.\n\
                   \n\
                   Every command except `daemon` talks to the running daemon, so start it first \
                   with `waytool daemon`. Commands then return almost at once."

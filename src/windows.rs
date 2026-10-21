@@ -2,9 +2,9 @@
 //! names. Every desktop has its own way to do this, and no Wayland
 //! protocol gives a window's geometry, so there's a provider per desktop:
 //! the gnome-shell extension on GNOME, and the compositor's IPC socket on
-//! sway and niri. Each reports a window as a dict with the same fields
-//! (see `windows` in the CLI help), leaving out what its desktop doesn't
-//! know.
+//! sway, niri and Hyprland. Each reports a window as a dict with the same
+//! fields (see `windows` in the CLI help), leaving out what its desktop
+//! doesn't know.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,6 +26,8 @@ pub(crate) enum Windows {
     Sway(PathBuf),
     /// niri's IPC socket.
     Niri(PathBuf),
+    /// Hyprland's IPC socket.
+    Hyprland(PathBuf),
     /// No provider: why.
     Unavailable(String),
 }
@@ -42,6 +44,11 @@ impl Windows {
         if let Some(sock) = env_socket("NIRI_SOCKET") {
             return Windows::Niri(sock);
         }
+        if let Some(sock) = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")
+            .and_then(|sig| hyprland_socket(Path::new(&sig)))
+        {
+            return Windows::Hyprland(sock);
+        }
         // Otherwise (a systemd unit the variables didn't reach), the IPC
         // socket our compositor made: both name theirs with their pid.
         if let Some(pid) = compositor {
@@ -55,6 +62,9 @@ impl Windows {
             {
                 return Windows::Niri(sock);
             }
+            if let Some(sock) = hyprland_socket_for(pid) {
+                return Windows::Hyprland(sock);
+            }
         }
         // gnome-shell, if it's the compositor (not just on the bus, as it
         // is for a compositor nested inside GNOME).
@@ -65,7 +75,7 @@ impl Windows {
         }
         Windows::Unavailable(
             "this desktop has no window provider (GNOME with the waytool extension, \
-             sway, or niri)"
+             sway, niri, or Hyprland)"
                 .into(),
         )
     }
@@ -76,6 +86,7 @@ impl Windows {
             Windows::Gnome(_) => "the gnome-shell extension".into(),
             Windows::Sway(sock) => format!("sway ({})", sock.display()),
             Windows::Niri(sock) => format!("niri ({})", sock.display()),
+            Windows::Hyprland(sock) => format!("Hyprland ({})", sock.display()),
             Windows::Unavailable(why) => format!("nowhere: {why}"),
         }
     }
@@ -86,6 +97,7 @@ impl Windows {
             Windows::Gnome(bus) => ext_call(&ext_proxy(bus).await?, "GetWindows", &()).await,
             Windows::Sway(sock) => sway_windows(sock).await,
             Windows::Niri(sock) => niri_windows(sock).await,
+            Windows::Hyprland(sock) => hyprland_windows(sock).await,
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
     }
@@ -113,6 +125,15 @@ impl Windows {
             Windows::Niri(sock) => {
                 let request = serde_json::json!({"Action": {"FocusWindow": {"id": id}}});
                 niri_request(sock, &request).await.map(|_| ())
+            }
+            Windows::Hyprland(sock) => {
+                let reply =
+                    hyprland_request(sock, &format!("dispatch focuswindow address:0x{id:x}"))
+                        .await?;
+                if reply.trim() != "ok" {
+                    return Err(anyhow!("Hyprland: {}", reply.trim()));
+                }
+                Ok(())
             }
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
@@ -415,6 +436,139 @@ async fn niri_windows(sock: &Path) -> Result<Vec<WindowDict>> {
         .collect()
 }
 
+/* ----- Hyprland ----- */
+
+/// The IPC socket of the Hyprland instance `signature`
+/// ($XDG_RUNTIME_DIR/hypr/<signature>/.socket.sock).
+fn hyprland_socket(signature: &Path) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("hypr");
+    let sock = dir.join(signature).join(".socket.sock");
+    sock.exists().then_some(sock)
+}
+
+/// The IPC socket of the Hyprland instance with process id `pid`: each
+/// instance's directory has a hyprland.lock whose first line is its pid.
+fn hyprland_socket_for(pid: u32) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("hypr");
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|instance| {
+            std::fs::read_to_string(instance.join("hyprland.lock"))
+                .is_ok_and(|lock| lock.lines().next() == Some(&pid.to_string()))
+        })
+        .map(|instance| instance.join(".socket.sock"))
+        .filter(|sock| sock.exists())
+}
+
+/// One Hyprland IPC request (hyprctl's protocol: the request, then the
+/// reply until the socket closes).
+async fn hyprland_request(sock: &Path, request: &str) -> Result<String> {
+    let mut stream = UnixStream::connect(sock)
+        .await
+        .with_context(|| format!("connect to Hyprland at {}", sock.display()))?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .context("Hyprland IPC write")?;
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .await
+        .context("Hyprland IPC read")?;
+    Ok(reply)
+}
+
+async fn hyprland_windows(sock: &Path) -> Result<Vec<WindowDict>> {
+    let clients = hyprland_request(sock, "j/clients").await?;
+    let monitors = hyprland_request(sock, "j/monitors").await?;
+    let active = hyprland_request(sock, "j/activewindow").await?;
+    hyprland_parse(&clients, &monitors, &active)
+}
+
+/// `active` is the `activewindow` reply: the window with keyboard
+/// focus, or `{}` with none. (A client's `focusHistoryID` stays 0 when
+/// focus moves to an empty workspace, so it can't say.)
+fn hyprland_parse(clients: &str, monitors: &str, active: &str) -> Result<Vec<WindowDict>> {
+    let clients: serde_json::Value =
+        serde_json::from_str(clients).context("Hyprland clients reply")?;
+    let monitors: serde_json::Value =
+        serde_json::from_str(monitors).context("Hyprland monitors reply")?;
+    let monitors = monitors.as_array().cloned().unwrap_or_default();
+    let active: serde_json::Value =
+        serde_json::from_str(active).context("Hyprland activewindow reply")?;
+    let focused = active["address"].as_str();
+    let int = |v: &serde_json::Value| v.as_i64().unwrap_or(0) as i32;
+    clients
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["mapped"].as_bool() != Some(false))
+        .map(|c| {
+            let id = c["address"]
+                .as_str()
+                .and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            let monitor = monitors.iter().find(|m| m["id"] == c["monitor"]);
+            // A window's workspace is showing if it's some monitor's
+            // active one.
+            let ws = &c["workspace"];
+            let active = monitors.iter().any(|m| {
+                let a = &m["activeWorkspace"];
+                if ws["id"].is_number() {
+                    a["id"] == ws["id"]
+                } else {
+                    a["name"] == ws["name"]
+                }
+            });
+            // fullscreen is a mode number in newer releases, a bool in
+            // older ones.
+            let fullscreen = c["fullscreen"]
+                .as_bool()
+                .unwrap_or(c["fullscreen"].as_i64().unwrap_or(0) != 0);
+            let class = c["class"].as_str().unwrap_or("");
+            let (x, y) = (int(&c["at"][0]), int(&c["at"][1]));
+            let (w, h) = (int(&c["size"][0]), int(&c["size"][1]));
+            dict(vec![
+                ("id", Value::U64(id)),
+                ("title", c["title"].as_str().unwrap_or("").into()),
+                ("app_id", class.into()),
+                ("wm_class", class.into()),
+                ("pid", Value::I32(int(&c["pid"]))),
+                (
+                    "monitor",
+                    monitor
+                        .and_then(|m| m["name"].as_str())
+                        .unwrap_or("")
+                        .into(),
+                ),
+                ("is_x11", c["xwayland"].as_bool().unwrap_or(false).into()),
+                ("frame_x", Value::I32(x)),
+                ("frame_y", Value::I32(y)),
+                ("frame_w", Value::I32(w)),
+                ("frame_h", Value::I32(h)),
+                ("client_x", Value::I32(x)),
+                ("client_y", Value::I32(y)),
+                ("client_w", Value::I32(w)),
+                ("client_h", Value::I32(h)),
+                (
+                    "focused",
+                    (focused.is_some() && c["address"].as_str() == focused).into(),
+                ),
+                ("minimized", c["hidden"].as_bool().unwrap_or(false).into()),
+                ("fullscreen", fullscreen.into()),
+                (
+                    "on_all_workspaces",
+                    c["pinned"].as_bool().unwrap_or(false).into(),
+                ),
+                ("workspace", ws["name"].as_str().unwrap_or("").into()),
+                ("on_active_workspace", active.into()),
+            ])
+        })
+        .collect()
+}
+
 /* ----- selectors ----- */
 
 /// Case-insensitive substring match against a window's wm_class,
@@ -528,6 +682,38 @@ mod tests {
         let bus = zbus::Connection::session().await.unwrap();
         let wayland = Wayland::connect().unwrap();
         println!("{}", Windows::detect(&bus, &wayland).await.describe());
+    }
+
+    #[test]
+    fn hyprland_clients_become_window_dicts() {
+        let clients = r#"[{
+            "address": "0x5581f2c0a8a0", "mapped": true, "hidden": false,
+            "at": [10, 40], "size": [800, 600],
+            "workspace": {"id": 2, "name": "2"}, "floating": false, "monitor": 1,
+            "class": "foot", "title": "~", "pid": 4242, "xwayland": false,
+            "pinned": false, "fullscreen": 0, "focusHistoryID": 0
+        }, {
+            "address": "0x10", "mapped": false, "at": [0, 0], "size": [1, 1],
+            "workspace": {"id": 3, "name": "3"}, "monitor": 0, "class": "x",
+            "title": "", "pid": 1, "focusHistoryID": 4
+        }]"#;
+        let monitors = r#"[{"id": 0, "name": "DP-1", "activeWorkspace": {"id": 1, "name": "1"}},
+                           {"id": 1, "name": "DP-2", "activeWorkspace": {"id": 2, "name": "2"}}]"#;
+        let windows =
+            hyprland_parse(clients, monitors, r#"{"address": "0x5581f2c0a8a0"}"#).unwrap();
+        assert_eq!(windows.len(), 1, "unmapped windows are left out");
+        let w = &windows[0];
+        assert_eq!(dict_i64(w, "id").unwrap(), 0x5581f2c0a8a0);
+        assert_eq!(dict_i64(w, "frame_x").unwrap(), 10);
+        assert!(dict_bool(w, "focused"));
+        assert!(dict_bool(w, "on_active_workspace"));
+        assert_eq!(render_value(&w["monitor"]), "DP-2");
+        assert!(window_matches(w, "foot"));
+
+        // Focus on an empty workspace: no window has it, though foot's
+        // focusHistoryID is still 0.
+        let windows = hyprland_parse(clients, monitors, "{}").unwrap();
+        assert!(!dict_bool(&windows[0], "focused"));
     }
 
     #[test]
