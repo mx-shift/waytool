@@ -1,7 +1,8 @@
 //! Typing on an XKB keyboard layout: where each keysym is (which key,
 //! which level), which modifier keys select a level given the modifiers
-//! already in effect, and which keys a virtual keyboard is holding. The
-//! libei keyboard (`eis`) types through this and sends the key events.
+//! already in effect, and which keys a virtual keyboard is holding. Both
+//! the libei keyboard (`eis`) and the Wayland virtual keyboard (`wlr_input`)
+//! type through this; they differ only in how the key events are sent.
 
 use std::collections::HashMap;
 
@@ -134,6 +135,83 @@ pub(crate) fn compile(text: String) -> Result<Vec<Layout>> {
     )
     .ok_or_else(|| anyhow!("couldn't compile the keymap"))?;
     Ok(index_keymap(&keymap))
+}
+
+/// Add a key for each keysym in `extras` to keymap text `base`, at
+/// keycodes the keymap leaves free, and return the new keymap text.
+///
+/// For a Wayland virtual keyboard, whose client supplies the keymap: the
+/// user's own keymap keeps every real key where it is (so apps that read
+/// keycodes, like emulators, see the keys they expect), and characters
+/// the layout lacks get keys of their own. Keycodes X clients can see
+/// (9-255) are used first. The added keys are named `W000`, `W001`, ...:
+/// XWayland compiles the keymap with xkbcomp, which allows at most four
+/// characters.
+pub(crate) fn extend(base: &str, extras: &[u32]) -> Result<String> {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        base.to_owned(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::COMPILE_NO_FLAGS,
+    )
+    .ok_or_else(|| anyhow!("couldn't compile the keymap"))?;
+    let mut text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+    if extras.is_empty() {
+        return Ok(text);
+    }
+    let max = keymap.max_keycode().raw();
+    // XKB keycode 8 is evdev 0, KEY_RESERVED, which clients may drop.
+    let codes: Vec<u32> = (9..=max.max(255))
+        .filter(|k| keymap.key_get_name(xkb::Keycode::new(*k)).is_none())
+        .chain(max.max(255) + 1..)
+        .take(extras.len())
+        .collect();
+    let (mut keycodes, mut symbols) = (String::new(), String::new());
+    for (i, (code, sym)) in codes.iter().zip(extras).enumerate() {
+        let name = xkb::keysym_get_name(xkb::Keysym::new(*sym));
+        keycodes.push_str(&format!("\t<W{i:03X}> = {code};\n"));
+        symbols.push_str(&format!("\tkey <W{i:03X}> {{ [ {name} ] }};\n"));
+    }
+    insert_at_section_end(&mut text, "xkb_keycodes", &keycodes)?;
+    insert_at_section_end(&mut text, "xkb_symbols", &symbols)?;
+    let top = codes.iter().copied().max().unwrap_or(max);
+    if top > max {
+        let old = format!("maximum = {max};");
+        if !text.contains(&old) {
+            return Err(anyhow!("the keymap text has no `{old}` to raise"));
+        }
+        text = text.replacen(&old, &format!("maximum = {top};"), 1);
+    }
+    Ok(text)
+}
+
+/// Whether keymap text is one `extend` made: it has the first added key.
+pub(crate) fn is_extended(text: &str) -> bool {
+    text.contains("<W000>")
+}
+
+/// The system's default keymap as text: XKB's default rules, model and
+/// layout, which the `XKB_DEFAULT_*` environment variables override.
+pub(crate) fn default_keymap() -> Result<String> {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_names(&context, "", "", "", "", None, xkb::COMPILE_NO_FLAGS)
+        .ok_or_else(|| anyhow!("couldn't compile the default keymap"))?;
+    Ok(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
+}
+
+/// Insert `lines` just before the `};` that closes `section` in keymap
+/// text as xkbcommon writes it.
+fn insert_at_section_end(text: &mut String, section: &str, lines: &str) -> Result<()> {
+    let start = text
+        .find(section)
+        .ok_or_else(|| anyhow!("the keymap text has no {section} section"))?;
+    let end = text[start..]
+        .find("\n};")
+        .map(|i| start + i + 1)
+        .ok_or_else(|| anyhow!("the keymap's {section} section doesn't end"))?;
+    text.insert_str(end, lines);
+    Ok(())
 }
 
 /// Keysyms of the keys that can supply a modifier for a level, most
@@ -423,6 +501,28 @@ mod tests {
             layout().press_for(0x0100_20ac, 0),
             Some((13 - 8, vec![ALTGR]))
         );
+    }
+
+    #[test]
+    fn extended_keymaps_type_what_the_layout_lacks() {
+        let base = xkb::Keymap::new_from_string(
+            &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            KEYMAP.into(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::COMPILE_NO_FLAGS,
+        )
+        .unwrap()
+        .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let grin = 0x0101_f600;
+        let text = extend(&base, &[grin, 0x20ac]).unwrap();
+        let l = compile(text).unwrap().remove(0);
+        // Each extra keysym is alone on a key of its own; the real keys
+        // stay where they were.
+        let (grin_key, mods) = l.press_for(grin, 0).unwrap();
+        assert!(mods.is_empty());
+        assert!(grin_key + 8 <= 255, "{grin_key}");
+        assert_ne!(Some(grin_key), l.press_for(0x20ac, 0).map(|(k, _)| k));
+        assert_eq!(l.press_for(0x61, 0), Some((A, vec![])));
     }
 
     #[test]

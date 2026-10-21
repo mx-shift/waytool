@@ -1,7 +1,8 @@
 //! waytool: command-line keyboard and pointer input, screenshots
-//! and window control on Wayland, through the freedesktop RemoteDesktop
-//! and ScreenCast portals, with window information from the desktop's
-//! own source (see `windows`).
+//! and window control on Wayland: through the freedesktop RemoteDesktop
+//! and ScreenCast portals where the desktop offers them, else Wayland's
+//! virtual input protocols (see `backend`), with window
+//! information from each desktop's own source (see `windows`).
 //!
 //! Architecture: one persistent daemon owns the session; every other
 //! subcommand (`key`, `type`, `click`, `screenshot`, ...) is a thin
@@ -9,13 +10,15 @@
 //! makes one D-Bus call (see `protocol`).
 //!
 //! Run `waytool daemon` (in a terminal or as a systemd user unit).
-//! Each start shows the screen-sharing consent dialog — accept it.
-//! Commands reuse that session until the daemon exits.
+//! Through the portals each start shows the screen-sharing consent
+//! dialog — accept it. Commands reuse that session until the daemon
+//! exits.
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 mod atspi;
+mod backend;
 mod capture;
 mod daemon;
 mod display;
@@ -27,6 +30,7 @@ mod portal;
 mod protocol;
 mod wayland;
 mod windows;
+mod wlr_input;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -36,9 +40,11 @@ use clap::{Parser, Subcommand};
     about = "Keyboard and pointer input, screenshots and window control on Wayland.",
     long_about = "Keyboard and pointer input, screenshots and window control on Wayland.\n\
                   \n\
-                  Input and screenshots go through the RemoteDesktop and ScreenCast portals, \
-                  which need libei (GNOME 45+, KDE Plasma 6.1+, COSMIC); the daemon asks for \
-                  screen-sharing consent when it starts.\n\
+                  Input and screenshots go through the RemoteDesktop and ScreenCast portals \
+                  where the desktop offers them with libei (GNOME 45+, KDE Plasma 6.1+, COSMIC), \
+                  asking for screen-sharing consent when the daemon starts; elsewhere (sway and \
+                  other wlroots compositors, Hyprland, niri) through Wayland's virtual input \
+                  protocols, which ask nothing (no screenshots there yet).\n\
                   \n\
                   [windows]  Needs the desktop's window information: on GNOME, the waytool \
                   gnome-shell extension. Without it these commands fail with an error saying \
@@ -57,10 +63,11 @@ enum Cmd {
     /* ----- meta / lifecycle ----- */
     /// Run the daemon that holds the input and capture session.
     ///
-    /// Each start asks for screen-sharing consent, and so does a display
-    /// change that ends a shared monitor's stream. Other commands reuse
-    /// the session until the daemon exits. Stop it with Ctrl-C, or from
-    /// the desktop's screen-sharing indicator.
+    /// Through the portals (GNOME, KDE Plasma, COSMIC) each start asks for
+    /// screen-sharing consent, and so does a display change that ends a
+    /// shared monitor's stream. Other commands reuse the session until
+    /// the daemon exits. Stop it with Ctrl-C, or from the desktop's
+    /// screen-sharing indicator.
     Daemon,
 
     /// Check that the daemon is up; prints `pong`.
@@ -117,9 +124,10 @@ enum Cmd {
     /// A newline or tab types Return or Tab, and the modifiers each
     /// character's level needs are pressed with it; use `key-chord` for
     /// shortcuts. A character that isn't on the keyboard layout (an emoji,
-    /// say) types too on GNOME, as text through the gnome-shell extension,
-    /// which reaches windows that take text input (GTK, Qt 6, Firefox) but
-    /// not X11 apps or emulators; there the whole string goes that way, to
+    /// say) types too: as a key of its own under the Wayland backend, and
+    /// on GNOME as text through the gnome-shell extension, which
+    /// reaches windows that take text input (GTK, Qt 6, Firefox) but not
+    /// X11 apps or emulators; there the whole string goes that way, to
     /// keep its order. A string that can't be typed is rejected before
     /// anything is typed.
     Type {
@@ -245,8 +253,9 @@ enum Cmd {
 
     /// List the capture streams: index, PipeWire node, position and size.
     ///
-    /// These are the monitors shared in the consent dialog, each with its
-    /// PipeWire node. Position and size are the monitor's rect in global
+    /// Through the portals these are the monitors shared in the consent
+    /// dialog, each with its PipeWire node; under the Wayland backend,
+    /// every monitor. Position and size are the monitor's rect in global
     /// logical coordinates.
     Streams,
 
@@ -460,7 +469,8 @@ async fn call(cmd: Cmd) -> Result<()> {
                     .size
                     .map(|(w, h)| format!("{w}x{h}"))
                     .unwrap_or_else(|| "?".into());
-                println!("{i}\t{}\t{pos}\t{size}", s.node_id);
+                let node = s.node_id.map_or("-".into(), |n| n.to_string());
+                println!("{i}\t{node}\t{pos}\t{size}");
             }
         }
         Cmd::StreamAt { x, y } => {

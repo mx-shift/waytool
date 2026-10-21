@@ -1,24 +1,28 @@
 //! Daemon mode for waytool.
 //!
 //! Architecture:
-//! - `waytool daemon` establishes one RemoteDesktop + ScreenCast
-//!   portal session, connects its input through libei (`eis`), finds
-//!   the desktop's window source (`windows`), then serves the D-Bus
+//! - `waytool daemon` sets up input and capture (a RemoteDesktop
+//!   and ScreenCast portal session with libei input, or Wayland's
+//!   virtual input protocols; see `backend`), finds the
+//!   desktop's window source (`windows`), then serves the D-Bus
 //!   interface in `protocol` peer-to-peer on a unix socket.
 //! - All other subcommands (`key`, `type`, `click`, `screenshot`, ...)
 //!   are thin clients that connect to the socket and make one call.
 //!
-//! Why a daemon: a portal session costs a consent dialog. The portal's
+//! Why a daemon: a portal session costs a consent dialog (the Wayland
+//! backend needs none, but works the same way). The portal's
 //! restore tokens are meant to skip it, but GNOME (as of 49) doesn't
 //! restore screencast streams from one, so a client per command would
 //! ask every time. One long-lived session asks once per daemon start.
 //!
 //! Lifecycle:
 //! - The user runs `waytool daemon` in a terminal or as a systemd
-//!   user unit. Each start shows the consent dialog; commands reuse the
-//!   session until the daemon exits.
-//! - A display change that ends a shared monitor's stream needs a new
-//!   session, and so new consent (see `spawn_display_watcher`).
+//!   user unit. Through the portals each start shows the consent dialog;
+//!   commands reuse the session until the daemon exits.
+//! - Through the portals, a display change that ends a shared monitor's
+//!   stream needs a new session, and so new consent (see
+//!   `spawn_display_watcher`). The Wayland backend follows the outputs
+//!   as they are.
 //! - Nothing is kept on disk between runs.
 
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -32,6 +36,7 @@ use futures_util::StreamExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, watch};
 
+use crate::backend::{Backend, Choice, Native};
 use crate::extension::{can_commit_text, commit_text, forward_key};
 use crate::portal::Portal;
 use crate::protocol::{Error, Frame, StreamDesc, UiTree, WindowDict};
@@ -62,10 +67,11 @@ fn sd_notify(msg: &str) {
 
 /// State shared by every client connection.
 pub(crate) struct Daemon {
-    /// The current portal session, swapped wholesale on re-establish.
-    /// Callers take a snapshot (`portal()`) and use that for the whole
-    /// request, so nothing holds this lock across an await.
-    portal: std::sync::Mutex<Arc<Portal>>,
+    /// The current backend session, swapped wholesale when a display
+    /// change re-establishes the portal's. Callers take a snapshot
+    /// (`backend()`) and use that for the whole request, so nothing
+    /// holds this lock across an await.
+    backend: std::sync::Mutex<Arc<Backend>>,
     /// Serializes input requests, so one client's keystrokes and clicks
     /// never interleave with another's. Read-only requests and captures
     /// don't take it, so a long `type` doesn't block them.
@@ -93,8 +99,8 @@ pub(crate) struct Daemon {
 }
 
 impl Daemon {
-    fn portal(&self) -> Arc<Portal> {
-        self.portal.lock().unwrap().clone()
+    fn backend(&self) -> Arc<Backend> {
+        self.backend.lock().unwrap().clone()
     }
 
     async fn a11y(&self) -> Result<zbus::Connection> {
@@ -139,10 +145,10 @@ impl Daemon {
         Ok(())
     }
 
-    /// Take the input lock and the portal to send input through.
+    /// Take the input lock and the backend to send input through.
     /// Refused while the screen is locked: the compositor would hand the
     /// keys and clicks to the unlock prompt.
-    async fn input(&self) -> Result<(MutexGuard<'_, ()>, Arc<Portal>)> {
+    async fn input(&self) -> Result<(MutexGuard<'_, ()>, Arc<Backend>)> {
         self.check_ready()?;
         if screen_locked().await {
             return Err(anyhow!(
@@ -150,37 +156,33 @@ impl Daemon {
             ));
         }
         let guard = self.input.lock().await;
-        Ok((guard, self.portal()))
+        Ok((guard, self.backend()))
     }
 }
 
-/// Watch a portal session and shut the daemon down when it ends: the
-/// portal closed it (the user stopped sharing, or revoked consent), or
-/// its libei connection was lost, so input can no longer be sent. Stops
-/// watching, and lets go of the session, when a re-establish retires it.
+/// Watch a backend session and shut the daemon down when it ends: the
+/// portal closed it (the user stopped sharing, or revoked consent), its
+/// libei connection was lost, or the Wayland connection was. Stops
+/// watching, and lets go of the session, when a re-establish retires
+/// it.
 ///
 /// A Closed signal never answers our own Close call (portal Session
 /// docs), so closing a retired session doesn't trip this.
-fn spawn_session_watcher(portal: &Arc<Portal>, daemon: Arc<Daemon>) {
-    let portal = portal.clone();
+fn spawn_session_watcher(backend: &Arc<Backend>, daemon: Arc<Daemon>) {
+    let backend = backend.clone();
     tokio::spawn(async move {
-        let mut closed = match portal.session.receive_closed().await {
-            Ok(closed) => closed,
-            Err(e) => {
-                eprintln!(
-                    "waytool: could not watch session Closed signal ({e:#}); \
-                     daemon will not auto-exit when capture stops"
-                );
-                return;
+        let retired = async {
+            match backend.portal() {
+                Some(p) => p.retired.notified().await,
+                None => std::future::pending().await,
             }
         };
         let why = tokio::select! {
             // Retirement first: closing a retired session also ends its
             // libei connection, and that mustn't read as a loss.
             biased;
-            _ = portal.retired.notified() => return,
-            _ = closed.next() => "portal session closed (screen sharing stopped or consent revoked)",
-            _ = portal.input_lost() => "lost the libei input connection",
+            _ = retired => return,
+            why = backend.ended() => why,
         };
         if daemon.stopping.load(Ordering::SeqCst) {
             return;
@@ -203,15 +205,15 @@ async fn reestablish(daemon: &Arc<Daemon>) {
     let established = Portal::establish(&daemon.bus, &daemon.outputs).await;
     let result = match established {
         Ok(portal) => {
-            let portal = Arc::new(portal);
+            let backend = Arc::new(Backend::Portal(portal));
             let _input = daemon.input.lock().await;
             let _capture = daemon.capture.lock().await;
-            let old = std::mem::replace(&mut *daemon.portal.lock().unwrap(), portal.clone());
-            spawn_session_watcher(&portal, daemon.clone());
-            old.retired.notify_one();
-            if let Err(e) = old.session.close().await {
-                eprintln!("waytool: closing the replaced session failed: {e:#}");
+            let old = std::mem::replace(&mut *daemon.backend.lock().unwrap(), backend.clone());
+            spawn_session_watcher(&backend, daemon.clone());
+            if let Some(p) = old.portal() {
+                p.retired.notify_one();
             }
+            old.close().await;
             Ok(())
         }
         Err(e) => Err(e),
@@ -232,7 +234,11 @@ async fn reestablish(daemon: &Arc<Daemon>) {
 /// still there. A change such as a new refresh rate keeps both, and
 /// needs no new consent.
 async fn session_survives(daemon: &Daemon) -> Result<bool> {
-    let portal = daemon.portal();
+    let backend = daemon.backend();
+    let Some(portal) = backend.portal() else {
+        // The Wayland backend follows the outputs as they are.
+        return Ok(true);
+    };
     if daemon.outputs.monitors() != portal.monitors
         || crate::display::physical_layout(&daemon.bus)
             .await
@@ -297,6 +303,9 @@ fn spawn_display_watcher(daemon: Arc<Daemon>) {
                     Ok(Err(_)) => return,
                     Err(_) => break,
                 }
+            }
+            if daemon.backend().portal().is_none() {
+                continue;
             }
             match session_survives(&daemon).await {
                 Ok(true) => {
@@ -495,23 +504,32 @@ pub async fn run_daemon() -> Result<()> {
         .await
         .context("connect to the session bus")?;
     let outputs = crate::wayland::Wayland::connect()?;
-    eprintln!("waytool: establishing portal session (consent prompt may appear)...");
-    sd_notify("STATUS=Waiting for screen-sharing consent");
-    let portal = tokio::select! {
-        portal = Portal::establish(&bus, &outputs) => Arc::new(portal?),
-        // Stopping the unit while the consent dialog is up.
-        _ = sigterm.recv() => return Ok(()),
-        _ = sigint.recv() => return Ok(()),
+    let backend = match crate::backend::choose(&bus, &outputs).await? {
+        Choice::Portal => {
+            eprintln!("waytool: establishing portal session (consent prompt may appear)...");
+            sd_notify("STATUS=Waiting for screen-sharing consent");
+            tokio::select! {
+                portal = Portal::establish(&bus, &outputs) => Backend::Portal(portal?),
+                // Stopping the unit while the consent dialog is up.
+                _ = sigterm.recv() => return Ok(()),
+                _ = sigint.recv() => return Ok(()),
+            }
+        }
+        Choice::Native => {
+            eprintln!("waytool: using Wayland protocols for input and capture");
+            Backend::Native(Box::new(Native::start(outputs.clone())?))
+        }
     };
+    let backend = Arc::new(backend);
     eprintln!(
         "waytool: session ready, {} stream(s)",
-        portal.streams().len()
+        backend.streams().len()
     );
 
     let windows = Windows::detect(&bus, &outputs).await;
     eprintln!("waytool: windows from {}", windows.describe());
     let daemon = Arc::new(Daemon {
-        portal: std::sync::Mutex::new(portal.clone()),
+        backend: std::sync::Mutex::new(backend.clone()),
         input: Mutex::new(()),
         capture: Mutex::new(()),
         stopping: AtomicBool::new(false),
@@ -523,9 +541,9 @@ pub async fn run_daemon() -> Result<()> {
         a11y: Mutex::new(None),
     });
 
-    // Exit the daemon if the portal session ends out from under us;
-    // re-establish it if the display is reconfigured.
-    spawn_session_watcher(&portal, daemon.clone());
+    // Exit the daemon if the session ends out from under us;
+    // re-establish the portal's if the display is reconfigured.
+    spawn_session_watcher(&backend, daemon.clone());
     spawn_display_watcher(daemon.clone());
 
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -575,16 +593,14 @@ pub async fn run_daemon() -> Result<()> {
     Ok(())
 }
 
-/// Close the portal session before exiting (portal Session.Close), so
-/// screen sharing ends now rather than whenever the portal notices the
-/// daemon has left the bus.
+/// End the session before exiting: close the portal's (portal
+/// Session.Close), so screen sharing ends now rather than whenever the
+/// portal notices the daemon has left the bus.
 async fn shutdown(daemon: &Daemon) {
-    eprintln!("waytool: shutting down; closing portal session");
+    eprintln!("waytool: shutting down");
     sd_notify("STOPPING=1");
     daemon.stopping.store(true, Ordering::SeqCst);
-    if let Err(e) = daemon.portal().session.close().await {
-        eprintln!("waytool: closing portal session failed: {e:#}");
-    }
+    daemon.backend().close().await;
 }
 
 fn keysym(name: &str) -> Result<u32> {
@@ -658,7 +674,7 @@ const TEXT_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// one queue and one order. Keys still waiting on the engine from an
 /// earlier request can still land after it.
 async fn type_text(
-    portal: &Portal,
+    portal: &Backend,
     extension: Option<&zbus::Connection>,
     text: &str,
     delay_ms: u32,
@@ -748,7 +764,7 @@ async fn type_text(
 /// (the modifier) is the last to come up — the held-modifier discipline
 /// emulators expect. If a press fails, the keys already down are still
 /// released, so an error never leaves a modifier stuck.
-async fn key_chord(portal: &Portal, syms: &[u32]) -> Result<()> {
+async fn key_chord(portal: &Backend, syms: &[u32]) -> Result<()> {
     let mut pressed = 0;
     let mut result = Ok(());
     for sym in syms {
@@ -957,12 +973,13 @@ impl Service {
         Ok(())
     }
 
-    /// The portal streams, in index order.
+    /// The capture streams, in index order: the portal session's, or
+    /// every monitor under the Wayland backend.
     async fn streams(&self) -> Vec<StreamDesc> {
         self.daemon
-            .portal()
+            .backend()
             .streams()
-            .iter()
+            .into_iter()
             .map(|s| StreamDesc {
                 node_id: s.node_id,
                 position: s.position,
@@ -971,14 +988,13 @@ impl Service {
             .collect()
     }
 
-    /// Index of the stream whose portal-reported rect covers global
-    /// point (x, y).
+    /// Index of the stream whose rect covers global point (x, y).
     async fn stream_at(&self, x: f64, y: f64) -> Result<u32, Error> {
         let _call = self.admit()?;
         finite(&[x, y])?;
         let idx = self
             .daemon
-            .portal()
+            .backend()
             .streams()
             .iter()
             .position(|s| s.contains(x, y))
@@ -993,14 +1009,7 @@ impl Service {
         let _call = self.admit()?;
         self.daemon.check_ready()?;
         let _capture = self.daemon.capture.lock().await;
-        let portal = self.daemon.portal();
-        let node_ids: Vec<u32> = portal.streams().iter().map(|s| s.node_id).collect();
-        let fd = portal.pipewire_fd().await?;
-        let frames = tokio::task::spawn_blocking(move || {
-            crate::capture::pipewire_capture_frames(fd, &node_ids)
-        })
-        .await
-        .context("screenshot blocking task")??;
+        let frames = self.daemon.backend().capture().await?;
 
         let frames = frames
             .into_iter()

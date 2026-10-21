@@ -32,21 +32,6 @@ pub struct StreamInfo {
     pub mapping_id: Option<String>,
 }
 
-impl StreamInfo {
-    /// Does this stream's reported rect cover point (x, y) in global
-    /// screen coordinates?  Returns false if the portal didn't supply
-    /// position+size for this stream (Window-source streams).
-    pub fn contains(&self, x: f64, y: f64) -> bool {
-        match (self.position, self.size) {
-            (Some((sx, sy)), Some((sw, sh))) => {
-                let (sx, sy, sw, sh) = (sx as f64, sy as f64, sw as f64, sh as f64);
-                x >= sx && x < sx + sw && y >= sy && y < sy + sh
-            }
-            _ => false,
-        }
-    }
-}
-
 /// One established portal session: the RemoteDesktop + ScreenCast
 /// session, its libei connection, and the streams it started. Replaced wholesale when the display is reconfigured;
 /// anything still holding the old one keeps a consistent (if dead) view
@@ -135,11 +120,6 @@ impl Portal {
         self.eis.keysym(keysym, press)
     }
 
-    pub(crate) fn tap_keysym(&self, keysym: u32) -> Result<()> {
-        self.keysym(keysym, true)?;
-        self.keysym(keysym, false)
-    }
-
     /// Press and release a Linux evdev keycode.
     pub(crate) fn tap_keycode(&self, code: u32) -> Result<()> {
         self.eis.keycode(code, true)?;
@@ -149,11 +129,6 @@ impl Portal {
     /// Press or release a Linux evdev pointer button.
     pub(crate) fn button(&self, code: u32, press: bool) -> Result<()> {
         self.eis.button(code, press)
-    }
-
-    pub(crate) fn click(&self, code: u32) -> Result<()> {
-        self.button(code, true)?;
-        self.button(code, false)
     }
 
     /// Relative pointer motion in logical pixels.
@@ -307,24 +282,4 @@ async fn open_pipewire_remote(
     sc.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default())
         .await
         .context("portal OpenPipeWireRemote")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn contains_does_not_round_toward_zero() {
-        let s = StreamInfo {
-            node_id: 1,
-            position: Some((0, 0)),
-            size: Some((100, 50)),
-            mapping_id: None,
-        };
-        assert!(s.contains(0.0, 0.0));
-        assert!(s.contains(99.9, 49.9));
-        assert!(!s.contains(-0.5, 10.0));
-        assert!(!s.contains(100.0, 10.0));
-        assert!(!s.contains(f64::NAN, 10.0));
-    }
 }

@@ -63,7 +63,8 @@ impl From<anyhow::Error> for Error {
 #[derive(Debug, SerializeDict, DeserializeDict, Type)]
 #[zvariant(signature = "dict")]
 pub struct StreamDesc {
-    pub node_id: u32,
+    /// The PipeWire node, for a portal stream.
+    pub node_id: Option<u32>,
     pub position: Option<(i32, i32)>,
     pub size: Option<(i32, i32)>,
 }
@@ -287,7 +288,7 @@ mod tests {
 
         async fn streams(&self) -> Vec<StreamDesc> {
             vec![StreamDesc {
-                node_id: 42,
+                node_id: Some(42),
                 position: Some((-1920, 0)),
                 size: None,
             }]
@@ -319,7 +320,7 @@ mod tests {
 
         let streams = d.streams().await.unwrap();
         assert_eq!(streams.len(), 1);
-        assert_eq!(streams[0].node_id, 42);
+        assert_eq!(streams[0].node_id, Some(42));
         assert_eq!(streams[0].position, Some((-1920, 0)));
         assert_eq!(streams[0].size, None);
 
