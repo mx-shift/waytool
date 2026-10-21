@@ -49,7 +49,8 @@ use clap::{Parser, Subcommand};
                   \n\
                   [windows]  Needs the desktop's window information: the waytool \
                   gnome-shell extension on GNOME, or the compositor's IPC on sway, niri and \
-                  Hyprland. Without one these commands fail with an error saying so.\n\
+                  Hyprland; elsewhere wlr-foreign-toplevel-management gives windows without \
+                  positions. Without one these commands fail with an error saying so.\n\
                   \n\
                   Every command except `daemon` talks to the running daemon, so start it first \
                   with `waytool daemon`. Commands then return almost at once."
@@ -323,7 +324,8 @@ enum Cmd {
     /// are rejected, and so is a window that doesn't take focus (a modal
     /// dialog has it, say); the error names the window that has it. A
     /// following `key` or `type` goes to the same window. Needs window
-    /// positions, which niri gives only for floating windows.
+    /// positions, which niri gives only for floating windows and
+    /// wlr-foreign-toplevel-management not at all.
     ClickIn {
         /// Window id, or a pattern matching one window's wm_class, app_id
         /// or title.

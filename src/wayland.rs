@@ -23,6 +23,10 @@ use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_c
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+};
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 
@@ -57,6 +61,23 @@ pub(crate) struct Globals {
     pub image_copy: Option<ExtImageCopyCaptureManagerV1>,
     pub output_source: Option<ExtOutputImageCaptureSourceManagerV1>,
     pub screencopy: Option<ZwlrScreencopyManagerV1>,
+    pub foreign_toplevel: Option<ZwlrForeignToplevelManagerV1>,
+}
+
+/// A window as wlr-foreign-toplevel-management reports it: no geometry,
+/// and no id of its own, so it gets one here.
+#[derive(Clone)]
+pub(crate) struct Toplevel {
+    pub id: u64,
+    pub handle: ZwlrForeignToplevelHandleV1,
+    pub title: String,
+    pub app_id: String,
+    /// Connector names of the outputs it's on.
+    pub outputs: Vec<String>,
+    pub maximized: bool,
+    pub minimized: bool,
+    pub activated: bool,
+    pub fullscreen: bool,
 }
 
 /// What the event thread keeps current for the rest of the daemon.
@@ -66,6 +87,8 @@ struct Shared {
     monitors: Vec<(Monitor, wl_output::WlOutput)>,
     /// The seat keyboard's keymap text, when it has one.
     keymap: Option<String>,
+    /// Windows, where the compositor offers wlr-foreign-toplevel.
+    toplevels: Vec<Toplevel>,
     lost: bool,
 }
 
@@ -186,6 +209,11 @@ impl Wayland {
         (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
     }
 
+    /// The windows wlr-foreign-toplevel-management reports.
+    pub(crate) fn toplevels(&self) -> Vec<Toplevel> {
+        self.shared.lock().unwrap().toplevels.clone()
+    }
+
     /// Whether the connection has been lost.
     pub(crate) fn is_lost(&self) -> bool {
         self.shared.lock().unwrap().lost
@@ -230,6 +258,14 @@ pub(crate) struct State {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     shared: Arc<Mutex<Shared>>,
     outputs_changed: bool,
+    /// Toplevels by handle, with their state so far; `done` applies it.
+    toplevels: Vec<(
+        ZwlrForeignToplevelHandleV1,
+        Toplevel,
+        Vec<wl_output::WlOutput>,
+    )>,
+    next_toplevel: u64,
+    toplevels_changed: bool,
     keymap_changed: Option<String>,
     changes: tokio::sync::watch::Sender<u64>,
     keymaps: tokio::sync::watch::Sender<u64>,
@@ -282,6 +318,28 @@ impl State {
             if !same {
                 self.changes.send_modify(|g| *g += 1);
             }
+        }
+        if std::mem::take(&mut self.toplevels_changed) {
+            let names = |outputs: &[wl_output::WlOutput]| -> Vec<String> {
+                outputs
+                    .iter()
+                    .filter_map(|wl| {
+                        self.outputs
+                            .iter()
+                            .find(|o| o.wl.as_ref() == Some(wl))
+                            .map(|o| o.name.clone())
+                    })
+                    .collect()
+            };
+            let toplevels = self
+                .toplevels
+                .iter()
+                .map(|(_, t, outputs)| Toplevel {
+                    outputs: names(outputs),
+                    ..t.clone()
+                })
+                .collect();
+            self.shared.lock().unwrap().toplevels = toplevels;
         }
         if let Some(keymap) = self.keymap_changed.take() {
             self.shared.lock().unwrap().keymap = Some(keymap);
@@ -360,6 +418,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     }
                     "zwlr_screencopy_manager_v1" => {
                         g.screencopy = Some(registry.bind(name, version.min(3), qh, ()))
+                    }
+                    "zwlr_foreign_toplevel_manager_v1" => {
+                        g.foreign_toplevel = Some(registry.bind(name, version.min(3), qh, ()))
                     }
                     _ => {}
                 }
@@ -482,6 +543,79 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 Ok(text) => state.keymap_changed = Some(text),
                 Err(e) => eprintln!("waytool: couldn't read the seat's keymap: {e:#}"),
             }
+        }
+    }
+}
+
+impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrForeignToplevelManagerV1,
+        event: zwlr_foreign_toplevel_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } = event {
+            state.next_toplevel += 1;
+            let entry = Toplevel {
+                id: state.next_toplevel,
+                handle: toplevel.clone(),
+                title: String::new(),
+                app_id: String::new(),
+                outputs: Vec::new(),
+                maximized: false,
+                minimized: false,
+                activated: false,
+                fullscreen: false,
+            };
+            state.toplevels.push((toplevel, entry, Vec::new()));
+        }
+    }
+
+    wayland_client::event_created_child!(State, ZwlrForeignToplevelManagerV1, [
+        zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        handle: &ZwlrForeignToplevelHandleV1,
+        event: zwlr_foreign_toplevel_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwlr_foreign_toplevel_handle_v1::Event;
+        let Some(i) = state.toplevels.iter().position(|(h, _, _)| h == handle) else {
+            return;
+        };
+        let (_, t, outputs) = &mut state.toplevels[i];
+        match event {
+            Event::Title { title } => t.title = title,
+            Event::AppId { app_id } => t.app_id = app_id,
+            Event::OutputEnter { output } => outputs.push(output),
+            Event::OutputLeave { output } => outputs.retain(|o| o != &output),
+            Event::State { state: s } => {
+                // An array of native-endian u32 states.
+                let states: Vec<u32> = s
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_ne_bytes(*c))
+                    .collect();
+                t.maximized = states.contains(&0);
+                t.minimized = states.contains(&1);
+                t.activated = states.contains(&2);
+                t.fullscreen = states.contains(&3);
+            }
+            Event::Done => state.toplevels_changed = true,
+            Event::Closed => {
+                state.toplevels.remove(i).0.destroy();
+                state.toplevels_changed = true;
+            }
+            _ => {}
         }
     }
 }

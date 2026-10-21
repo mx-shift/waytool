@@ -2,9 +2,10 @@
 //! names. Every desktop has its own way to do this, and no Wayland
 //! protocol gives a window's geometry, so there's a provider per desktop:
 //! the gnome-shell extension on GNOME, and the compositor's IPC socket on
-//! sway, niri and Hyprland. Each reports a window as a dict with the same
-//! fields (see `windows` in the CLI help), leaving out what its desktop
-//! doesn't know.
+//! sway, niri and Hyprland. Elsewhere, wlr-foreign-toplevel-management
+//! lists windows, without geometry. Each reports a window as a dict with
+//! the same fields (see `windows` in the CLI help), leaving out what its
+//! desktop doesn't know.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +29,9 @@ pub(crate) enum Windows {
     Niri(PathBuf),
     /// Hyprland's IPC socket.
     Hyprland(PathBuf),
+    /// wlr-foreign-toplevel-management: titles, app ids and states, but
+    /// no geometry.
+    Toplevels(Arc<Wayland>),
     /// No provider: why.
     Unavailable(String),
 }
@@ -73,9 +77,12 @@ impl Windows {
         {
             return Windows::Gnome(bus.clone());
         }
+        if wayland.globals().foreign_toplevel.is_some() {
+            return Windows::Toplevels(wayland.clone());
+        }
         Windows::Unavailable(
             "this desktop has no window provider (GNOME with the waytool extension, \
-             sway, niri, or Hyprland)"
+             sway, niri, Hyprland, or wlr-foreign-toplevel-management)"
                 .into(),
         )
     }
@@ -87,6 +94,7 @@ impl Windows {
             Windows::Sway(sock) => format!("sway ({})", sock.display()),
             Windows::Niri(sock) => format!("niri ({})", sock.display()),
             Windows::Hyprland(sock) => format!("Hyprland ({})", sock.display()),
+            Windows::Toplevels(_) => "wlr-foreign-toplevel-management".into(),
             Windows::Unavailable(why) => format!("nowhere: {why}"),
         }
     }
@@ -98,6 +106,9 @@ impl Windows {
             Windows::Sway(sock) => sway_windows(sock).await,
             Windows::Niri(sock) => niri_windows(sock).await,
             Windows::Hyprland(sock) => hyprland_windows(sock).await,
+            Windows::Toplevels(wayland) => {
+                wayland.toplevels().iter().map(toplevel_window).collect()
+            }
             Windows::Unavailable(why) => Err(anyhow!("{why}")),
         }
     }
@@ -125,6 +136,20 @@ impl Windows {
             Windows::Niri(sock) => {
                 let request = serde_json::json!({"Action": {"FocusWindow": {"id": id}}});
                 niri_request(sock, &request).await.map(|_| ())
+            }
+            Windows::Toplevels(wayland) => {
+                let toplevel = wayland
+                    .toplevels()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .ok_or_else(|| anyhow!("no window with id {id}"))?;
+                let seat = wayland
+                    .globals()
+                    .seat
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("the compositor has no seat"))?;
+                toplevel.handle.activate(seat);
+                wayland.flush()
             }
             Windows::Hyprland(sock) => {
                 let reply =
@@ -211,6 +236,22 @@ async fn bus_name_pid(bus: &zbus::Connection, name: &str) -> Option<u32> {
     let dbus = zbus::fdo::DBusProxy::new(bus).await.ok()?;
     let name = zbus::names::BusName::try_from(name).ok()?;
     dbus.get_connection_unix_process_id(name).await.ok()
+}
+
+/* ----- wlr-foreign-toplevel-management ----- */
+
+fn toplevel_window(t: &crate::wayland::Toplevel) -> Result<WindowDict> {
+    dict(vec![
+        ("id", Value::U64(t.id)),
+        ("title", t.title.as_str().into()),
+        ("app_id", t.app_id.as_str().into()),
+        ("wm_class", t.app_id.as_str().into()),
+        ("monitor", t.outputs.join("+").into()),
+        ("focused", t.activated.into()),
+        ("minimized", t.minimized.into()),
+        ("maximized", t.maximized.into()),
+        ("fullscreen", t.fullscreen.into()),
+    ])
 }
 
 /* ----- sway ----- */

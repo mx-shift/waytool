@@ -186,6 +186,30 @@ jobs:
         run: tar -xzf dist/*.tar.gz --strip-components=1 -C /usr/local/bin --wildcards '*/waytool'
       - run: tests/integration/niri.sh
 
+  # The same on labwc, nested in headless sway, with windows through
+  # wlr-foreign-toplevel-management (tests/integration/labwc.sh).
+  labwc:
+    name: end-to-end on labwc
+    needs: binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+      options: --cap-add SYS_NICE
+    steps:
+      - name: Install sway, labwc and the test clients
+        run: dnf install -y --setopt=install_weak_deps=False sway labwc foot wev dbus-daemon pipewire-libs libxkbcommon xkeyboard-config gawk tar gzip findutils
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binary-x86_64
+          path: dist
+      - name: Install the binary
+        run: tar -xzf dist/*.tar.gz --strip-components=1 -C /usr/local/bin --wildcards '*/waytool'
+      - run: tests/integration/labwc.sh
+
   deb:
     name: deb (${{ matrix.arch }})
     strategy:
