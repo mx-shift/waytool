@@ -1,4 +1,22 @@
-//! Name tables for keys.
+//! Name tables for keys and pointer buttons.
+
+use anyhow::{Result, anyhow};
+
+pub(crate) fn button_code(name: &str) -> Result<u32> {
+    // Linux evdev button codes (asm-generic/input-event-codes.h).
+    Ok(match name {
+        "left" | "1" => 0x110,
+        "right" | "2" => 0x111,
+        "middle" | "3" => 0x112,
+        "back" | "8" => 0x116,
+        "forward" | "9" => 0x117,
+        _ => {
+            return Err(anyhow!(
+                "unknown button {name:?} (use left/right/middle/back/forward)"
+            ));
+        }
+    })
+}
 
 /// The keysym a key name means: any XKB keysym name (`Return`,
 /// `KP_Enter`, `F13`, `Print`, `period` — see xkbcommon-keysyms.h, case

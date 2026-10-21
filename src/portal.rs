@@ -28,6 +28,8 @@ pub struct StreamInfo {
     pub node_id: u32,
     pub position: Option<(i32, i32)>,
     pub size: Option<(i32, i32)>,
+    /// Matches the stream to its libei region (ScreenCast v5).
+    pub mapping_id: Option<String>,
 }
 
 impl StreamInfo {
@@ -55,13 +57,16 @@ pub(crate) struct Portal {
     sc: Screencast,
     /// Each portal stream, in portal order.
     streams: Vec<StreamInfo>,
+    /// Whether GNOME's physical layout mode was on (see `display`).
+    pub(crate) physical_layout: bool,
 }
 
 impl Portal {
     /// Establish a fresh portal session and connect its input. May
     /// surface a consent dialog.
-    pub(crate) async fn establish() -> Result<Portal> {
+    pub(crate) async fn establish(bus: &zbus::Connection) -> Result<Portal> {
         let (rd, sc, session, streams) = establish_session().await?;
+        let physical_layout = crate::display::physical_layout(bus).await.unwrap_or(false);
         let eis = match connect_input(&rd, &session).await {
             Ok(eis) => eis,
             Err(e) => {
@@ -76,6 +81,7 @@ impl Portal {
             eis,
             sc,
             streams,
+            physical_layout,
         })
     }
 
@@ -109,6 +115,44 @@ impl Portal {
     pub(crate) fn tap_keycode(&self, code: u32) -> Result<()> {
         self.eis.keycode(code, true)?;
         self.eis.keycode(code, false)
+    }
+
+    /// Press or release a Linux evdev pointer button.
+    pub(crate) fn button(&self, code: u32, press: bool) -> Result<()> {
+        self.eis.button(code, press)
+    }
+
+    pub(crate) fn click(&self, code: u32) -> Result<()> {
+        self.button(code, true)?;
+        self.button(code, false)
+    }
+
+    /// Move the pointer to screenshot pixel (x, y) of stream index
+    /// `stream`.
+    pub(crate) fn move_to_pixel(&self, stream: u32, x: f64, y: f64) -> Result<()> {
+        let s = self
+            .streams
+            .get(stream as usize)
+            .ok_or_else(|| anyhow!("no stream {stream}; `waytool streams` lists them"))?;
+        let rect = s.position.zip(s.size);
+        let mut region = self
+            .eis
+            .region_for(s.mapping_id.as_deref(), rect)
+            .ok_or_else(|| anyhow!("the compositor gave no libei region for stream {stream}"))?;
+        // In physical layout mode a monitor's logical size is its mode, so
+        // a screenshot pixel is one logical pixel whatever the region's
+        // scale says.
+        if self.physical_layout {
+            region.scale = 1.0;
+        }
+        let (w, h) = region.physical_size();
+        if !(0.0..w).contains(&x) || !(0.0..h).contains(&y) {
+            return Err(anyhow!(
+                "({x}, {y}) is outside stream {stream}'s {w:.0}x{h:.0} screenshot"
+            ));
+        }
+        let (gx, gy) = region.pixel_to_global(x, y);
+        self.eis.move_abs(gx, gy)
     }
 }
 
@@ -156,7 +200,7 @@ async fn start_session(
     session: &Session<RemoteDesktop>,
 ) -> Result<Vec<StreamInfo>> {
     let rd_opts = SelectDevicesOptions::default()
-        .set_devices(enumflags2::BitFlags::from(DeviceType::Keyboard))
+        .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
         // The restore token would be thrown away anyway (see the daemon
         // docs), so don't ask the portal to keep a grant around for it.
         .set_persist_mode(PersistMode::DoNot);
@@ -192,6 +236,7 @@ async fn start_session(
             node_id: s.pipe_wire_node_id(),
             position: s.position(),
             size: s.size(),
+            mapping_id: s.mapping_id().map(str::to_owned),
         })
         .collect();
     if streams.is_empty() {
@@ -231,6 +276,7 @@ mod tests {
             node_id: 1,
             position: Some((0, 0)),
             size: Some((100, 50)),
+            mapping_id: None,
         };
         assert!(s.contains(0.0, 0.0));
         assert!(s.contains(99.9, 49.9));

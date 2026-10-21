@@ -1,9 +1,9 @@
-//! waytool: command-line keyboard input and screenshots
+//! waytool: command-line keyboard and pointer input and screenshots
 //! on Wayland, through the freedesktop RemoteDesktop and ScreenCast
 //! portals.
 //!
 //! Architecture: one persistent daemon owns the session; every other
-//! subcommand (`key`, `type`, `screenshot`, ...) is a thin
+//! subcommand (`key`, `type`, `click`, `screenshot`, ...) is a thin
 //! client that connects to `$XDG_RUNTIME_DIR/waytool.sock` and
 //! makes one D-Bus call (see `protocol`).
 //!
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 mod capture;
 mod daemon;
+mod display;
 mod eis;
 mod keys;
 mod portal;
@@ -26,8 +27,8 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Keyboard input and screenshots on Wayland.",
-    long_about = "Keyboard input and screenshots on Wayland.\n\
+    about = "Keyboard and pointer input and screenshots on Wayland.",
+    long_about = "Keyboard and pointer input and screenshots on Wayland.\n\
                   \n\
                   Input and screenshots go through the RemoteDesktop and ScreenCast portals, \
                   which need libei (GNOME 45+, KDE Plasma 6.1+, COSMIC); the daemon asks for \
@@ -121,6 +122,45 @@ enum Cmd {
         hold: Option<u32>,
     },
 
+    /* ----- pointer ----- */
+    /// Move the pointer to a pixel of a stream's screenshot.
+    ///
+    /// X and Y are pixels of that stream's `screenshot` (0 to width and
+    /// height of its PNG), so they match what you read off it. Every pixel
+    /// is reachable, on scaled monitors too.
+    Move {
+        /// Pixel column in the stream's screenshot.
+        x: f64,
+        /// Pixel row in the stream's screenshot.
+        y: f64,
+        /// Stream index, from `streams`.
+        #[arg(long, default_value_t = 0)]
+        stream: u32,
+    },
+
+    /// Press and release a pointer button where the pointer is.
+    Click {
+        /// left, right, middle, back or forward.
+        #[arg(long, default_value = "left")]
+        button: String,
+    },
+
+    /// Move to a pixel of a stream's screenshot and click.
+    ///
+    /// Coordinates as for `move`.
+    ClickAt {
+        /// Pixel column in the stream's screenshot.
+        x: f64,
+        /// Pixel row in the stream's screenshot.
+        y: f64,
+        /// left, right, middle, back or forward.
+        #[arg(long, default_value = "left")]
+        button: String,
+        /// Stream index, from `streams`.
+        #[arg(long, default_value_t = 0)]
+        stream: u32,
+    },
+
     /* ----- capture ----- */
     /// Capture one frame per stream (shared monitor), as PNG.
     ///
@@ -142,8 +182,8 @@ enum Cmd {
 
     /// Print which stream covers a global logical point.
     ///
-    /// Useful for turning a global point into the stream whose screenshot
-    /// shows it.
+    /// Useful for turning a global point into the stream to screenshot or
+    /// click on.
     StreamAt {
         /// Global logical x.
         x: f64,
@@ -176,6 +216,17 @@ async fn call(cmd: Cmd) -> Result<()> {
         Cmd::KeyUp { name } => d.key_up(&name).await.map_err(protocol::describe)?,
         Cmd::Type { text, delay, hold } => d
             .type_text(&text, delay.unwrap_or(0), hold.unwrap_or(0))
+            .await
+            .map_err(protocol::describe)?,
+        Cmd::Move { x, y, stream } => d.move_to(x, y, stream).await.map_err(protocol::describe)?,
+        Cmd::Click { button } => d.click(&button).await.map_err(protocol::describe)?,
+        Cmd::ClickAt {
+            x,
+            y,
+            button,
+            stream,
+        } => d
+            .click_at(x, y, &button, stream)
             .await
             .map_err(protocol::describe)?,
         Cmd::Screenshot { out } => {

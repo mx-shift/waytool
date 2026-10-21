@@ -19,7 +19,7 @@
 //! level, given the modifiers already in effect, are pressed with it. A
 //! keysym that isn't on the layout can't be sent as a key at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
@@ -36,7 +36,7 @@ use xkbcommon::xkb;
 const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One past the highest evdev code (KEY_CNT in linux/input-event-codes.h).
-/// A key code outside the range is a protocol error that ends
+/// A key or button code outside the range is a protocol error that ends
 /// the whole libei connection, so it's refused before it's sent.
 const KEY_CNT: u32 = 0x300;
 
@@ -151,12 +151,16 @@ struct Slot {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
+    Pointer,
+    Absolute,
     Keyboard,
 }
 
 impl Which {
     fn name(self) -> &'static str {
         match self {
+            Which::Pointer => "pointer",
+            Which::Absolute => "absolute pointer",
             Which::Keyboard => "keyboard",
         }
     }
@@ -164,6 +168,10 @@ impl Which {
 
 #[derive(Default)]
 struct State {
+    /// Relative motion, buttons and scrolling.
+    pointer: Option<Slot>,
+    /// Absolute motion, with one region per stream.
+    absolute: Option<Slot>,
     keyboard: Option<Slot>,
     /// The keyboard's keymap, one entry per layout.
     layouts: Vec<Layout>,
@@ -177,22 +185,46 @@ struct State {
     held_keys: HashMap<u32, Vec<u32>>,
     /// How many held keys each modifier key we pressed is down for.
     modifier_holds: HashMap<u32, u32>,
+    /// Buttons we hold down.
+    held_buttons: HashSet<u32>,
     disconnected: Option<String>,
 }
 
 impl State {
     fn ready(&self) -> bool {
-        self.keyboard.as_ref().is_some_and(|s| s.resumed)
+        [&self.pointer, &self.absolute, &self.keyboard]
+            .iter()
+            .all(|s| s.as_ref().is_some_and(|s| s.resumed))
     }
 
     fn slot(&mut self, which: Which) -> Option<&mut Slot> {
         match which {
+            Which::Pointer => self.pointer.as_mut(),
+            Which::Absolute => self.absolute.as_mut(),
             Which::Keyboard => self.keyboard.as_mut(),
         }
     }
 
     fn slot_for(&mut self, device: &Device) -> Option<&mut Slot> {
-        self.keyboard.as_mut().filter(|s| &s.device == device)
+        [&mut self.pointer, &mut self.absolute, &mut self.keyboard]
+            .into_iter()
+            .flatten()
+            .find(|s| &s.device == device)
+    }
+
+    /// The device that sends buttons: the relative pointer, or failing
+    /// that the absolute one.
+    fn button_device(&self) -> Option<Which> {
+        [
+            (Which::Pointer, &self.pointer),
+            (Which::Absolute, &self.absolute),
+        ]
+        .into_iter()
+        .find(|(_, s)| {
+            s.as_ref()
+                .is_some_and(|s| s.device.has_capability(DeviceCapability::Button))
+        })
+        .map(|(which, _)| which)
     }
 
     /// The current layout, or why there's none to type with.
@@ -237,8 +269,8 @@ impl Drop for Eis {
 
 impl Eis {
     /// Run the libei handshake on `fd` (from ConnectToEIS), bind the
-    /// seat's keyboard, and wait for the compositor to offer and resume
-    /// it.
+    /// seat's pointer, absolute pointer and keyboard, and wait for the
+    /// compositor to offer and resume those devices.
     ///
     /// libei's event stream isn't Send, so it is read on a thread of its
     /// own, which keeps the shared state current until the connection
@@ -270,8 +302,14 @@ impl Eis {
         if let Some(why) = &st.disconnected {
             return Err(anyhow!("libei: {why}"));
         }
-        if st.keyboard.is_none() {
-            eprintln!("waytool: libei: the compositor offered no keyboard device");
+        for (name, slot) in [
+            ("pointer", &st.pointer),
+            ("absolute pointer", &st.absolute),
+            ("keyboard", &st.keyboard),
+        ] {
+            if slot.is_none() {
+                eprintln!("waytool: libei: the compositor offered no {name} device");
+            }
         }
         drop(st);
         Ok(eis)
@@ -280,7 +318,7 @@ impl Eis {
     /// Send events through interface `T` of one device, as one frame.
     ///
     /// The device stays emulating (no stop_emulating) while `keep` is
-    /// set — while keys are held. The protocol lets the
+    /// set — while keys or buttons are held. The protocol lets the
     /// compositor return a device to neutral when emulation stops, which
     /// would release them.
     fn emit<T: ei::Interface>(
@@ -417,6 +455,76 @@ impl Eis {
             }
         })
     }
+
+    /// Press or release an evdev pointer button.
+    pub(crate) fn button(&self, code: u32, press: bool) -> Result<()> {
+        check_code(code)?;
+        let mut st = self.state.lock().unwrap();
+        let which = st
+            .button_device()
+            .ok_or_else(|| anyhow!("the compositor offered no device with buttons"))?;
+        if press {
+            st.held_buttons.insert(code);
+        } else {
+            st.held_buttons.remove(&code);
+        }
+        let keep = !st.held_buttons.is_empty();
+        self.emit::<ei::Button>(&mut st, which, keep, |button| {
+            let state = if press {
+                ei::button::ButtonState::Press
+            } else {
+                ei::button::ButtonState::Released
+            };
+            button.button(code, state);
+        })
+    }
+
+    /// Absolute motion to global logical coordinates, which must fall
+    /// inside one of the absolute device's regions.
+    pub(crate) fn move_abs(&self, x: f64, y: f64) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let region = st
+            .absolute
+            .as_ref()
+            .and_then(|s| {
+                s.device
+                    .regions()
+                    .iter()
+                    .map(Region::from)
+                    .find(|r| r.contains(x, y))
+            })
+            .ok_or_else(|| anyhow!("({x}, {y}) is outside every monitor's region"))?;
+        // The compositor drops a position outside every region, and a
+        // point just inside the far edge can round onto it as f32.
+        let (x, y) = (region.inside_f32(x, true), region.inside_f32(y, false));
+        let keep = st.button_device() == Some(Which::Absolute) && !st.held_buttons.is_empty();
+        self.emit::<ei::PointerAbsolute>(&mut st, Which::Absolute, keep, |pointer| {
+            pointer.motion_absolute(x, y);
+        })
+    }
+
+    /// The region for a stream: by `mapping_id` when the portal gave
+    /// one, otherwise the region with the stream's logical rect.
+    pub(crate) fn region_for(
+        &self,
+        mapping_id: Option<&str>,
+        rect: Option<((i32, i32), (i32, i32))>,
+    ) -> Option<Region> {
+        let st = self.state.lock().unwrap();
+        let regions = st.absolute.as_ref()?.device.regions();
+        let found = match mapping_id {
+            Some(id) => regions.iter().find(|r| r.mapping_id.as_deref() == Some(id)),
+            None => None,
+        }
+        .or_else(|| {
+            let ((x, y), (w, h)) = rect?;
+            regions.iter().find(|r| {
+                (r.x as i64, r.y as i64, r.width as i64, r.height as i64)
+                    == (x as i64, y as i64, w as i64, h as i64)
+            })
+        })?;
+        Some(Region::from(found))
+    }
 }
 
 fn check_code(code: u32) -> Result<()> {
@@ -427,6 +535,57 @@ fn check_code(code: u32) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// An absolute device's region: a monitor's logical rect and scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Region {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub scale: f64,
+}
+
+impl From<&reis::event::Region> for Region {
+    fn from(r: &reis::event::Region) -> Self {
+        Region {
+            x: r.x.into(),
+            y: r.y.into(),
+            width: r.width.into(),
+            height: r.height.into(),
+            scale: if r.scale > 0.0 { r.scale.into() } else { 1.0 },
+        }
+    }
+}
+
+impl Region {
+    pub(crate) fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+
+    /// The physical size of the region: what a screenshot of it measures.
+    pub(crate) fn physical_size(&self) -> (f64, f64) {
+        (self.width * self.scale, self.height * self.scale)
+    }
+
+    /// The global logical position of physical pixel (px, py) — a point
+    /// read off this monitor's screenshot.
+    pub(crate) fn pixel_to_global(&self, px: f64, py: f64) -> (f64, f64) {
+        (self.x + px / self.scale, self.y + py / self.scale)
+    }
+
+    /// Coordinate `v` (x when `horizontal`, else y), which is inside the
+    /// region, as an f32 that is still inside it.
+    fn inside_f32(&self, v: f64, horizontal: bool) -> f32 {
+        let end = if horizontal {
+            self.x + self.width
+        } else {
+            self.y + self.height
+        } as f32;
+        let v = v as f32;
+        if v >= end { end.next_down() } else { v }
+    }
 }
 
 /// The libei thread: handshake, then keep `state` up to date from the
@@ -485,7 +644,13 @@ fn run_events(
 
 fn handle_event(st: &mut State, event: EiEvent) {
     match event {
-        EiEvent::SeatAdded(e) => e.seat.bind_capabilities(DeviceCapability::Keyboard.into()),
+        EiEvent::SeatAdded(e) => e.seat.bind_capabilities(
+            DeviceCapability::Pointer
+                | DeviceCapability::PointerAbsolute
+                | DeviceCapability::Keyboard
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        ),
         EiEvent::DeviceAdded(e) => {
             let device = e.device;
             let slot = Some(Slot {
@@ -510,11 +675,17 @@ fn handle_event(st: &mut State, event: EiEvent) {
                 st.held_keys.clear();
                 st.modifier_holds.clear();
                 st.keyboard = slot;
+            } else if device.has_capability(DeviceCapability::PointerAbsolute) {
+                st.absolute = slot;
+            } else if device.has_capability(DeviceCapability::Pointer) {
+                st.pointer = slot;
             }
         }
         EiEvent::DeviceRemoved(e) => {
-            if st.keyboard.as_ref().is_some_and(|s| s.device == e.device) {
-                st.keyboard = None;
+            for slot in [&mut st.pointer, &mut st.absolute, &mut st.keyboard] {
+                if slot.as_ref().is_some_and(|s| s.device == e.device) {
+                    *slot = None;
+                }
             }
         }
         // Emulation doesn't survive a pause: it starts afresh on resume.
@@ -745,5 +916,24 @@ mod tests {
             layout().press_for(0x0100_20ac, 0),
             Some((13 - 8, vec![ALTGR]))
         );
+    }
+
+    #[test]
+    fn regions_map_pixels_into_logical_space() {
+        let r = Region {
+            x: 1920.0,
+            y: 0.0,
+            width: 2560.0,
+            height: 1440.0,
+            scale: 1.5,
+        };
+        assert_eq!(r.physical_size(), (3840.0, 2160.0));
+        // The far corner pixel lands just inside the logical rect.
+        let (x, y) = r.pixel_to_global(3839.0, 2159.0);
+        assert!(r.contains(x, y), "({x}, {y})");
+        assert_eq!(r.pixel_to_global(0.0, 0.0), (1920.0, 0.0));
+        assert!(!r.contains(1919.5, 10.0));
+        // A point that rounds onto the far edge as f32 is kept inside.
+        assert!(r.inside_f32(4_479.999_999_9, true) < 4480.0);
     }
 }

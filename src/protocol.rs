@@ -106,6 +106,17 @@ pub trait Daemon {
     /// key down; 0 means no wait.
     fn type_text(&self, text: &str, delay_ms: u32, hold_ms: u32) -> Result<(), Error>;
 
+    /// Move the pointer to screenshot pixels (x, y) of stream index
+    /// `stream`.
+    #[zbus(name = "Move")]
+    fn move_to(&self, x: f64, y: f64, stream: u32) -> Result<(), Error>;
+    /// Press+release a pointer button (left, right, middle, back,
+    /// forward) at the current position.
+    fn click(&self, button: &str) -> Result<(), Error>;
+    /// Move to screenshot pixels (x, y) of stream index `stream`, then
+    /// click.
+    fn click_at(&self, x: f64, y: f64, button: &str, stream: u32) -> Result<(), Error>;
+
     /// The portal streams, in index order.
     fn streams(&self) -> Result<Vec<StreamDesc>, Error>;
     /// Index of the stream whose rect covers global point (x, y).

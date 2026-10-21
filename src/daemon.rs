@@ -5,7 +5,7 @@
 //!   portal session, connects its input through libei (`eis`), then
 //!   serves the D-Bus interface in `protocol` peer-to-peer on a unix
 //!   socket.
-//! - All other subcommands (`key`, `type`, `screenshot`, ...)
+//! - All other subcommands (`key`, `type`, `click`, `screenshot`, ...)
 //!   are thin clients that connect to the socket and make one call.
 //!
 //! Why a daemon: a portal session costs a consent dialog. The portal's
@@ -36,8 +36,8 @@ use crate::protocol::{Error, Frame, StreamDesc};
 pub(crate) struct Daemon {
     /// The portal session.
     portal: Arc<Portal>,
-    /// Serializes input requests, so one client's keystrokes never
-    /// interleave with another's. Read-only requests and captures
+    /// Serializes input requests, so one client's keystrokes and clicks
+    /// never interleave with another's. Read-only requests and captures
     /// don't take it, so a long `type` doesn't block them.
     input: Mutex<()>,
     /// Serializes frame captures, so overlapping screenshots queue
@@ -177,8 +177,11 @@ pub async fn run_daemon() -> Result<()> {
     let sock = crate::protocol::socket_path()?;
     let (_socket_file, listener) = SocketFile::bind(&sock).await?;
 
+    let bus = zbus::Connection::session()
+        .await
+        .context("connect to the session bus")?;
     eprintln!("waytool: establishing portal session (consent prompt may appear)...");
-    let portal = Arc::new(Portal::establish().await?);
+    let portal = Arc::new(Portal::establish(&bus).await?);
     eprintln!(
         "waytool: session ready, {} stream(s)",
         portal.streams().len()
@@ -423,6 +426,35 @@ impl Service {
         let (_input, portal) = self.daemon.input().await?;
         let hangup = self.hangup.clone();
         type_text(&portal, &text, delay_ms, hold_ms, hangup).await?;
+        Ok(())
+    }
+
+    /// Absolute move to a pixel of stream `stream`'s screenshot.
+    #[zbus(name = "Move")]
+    async fn move_to(&self, x: f64, y: f64, stream: u32) -> Result<(), Error> {
+        let _call = self.admit()?;
+        finite(&[x, y])?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.move_to_pixel(stream, x, y)?;
+        Ok(())
+    }
+
+    async fn click(&self, button: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let code = crate::keys::button_code(&button)?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.click(code)?;
+        Ok(())
+    }
+
+    /// Move + click, in screenshot pixels of stream index `stream`.
+    async fn click_at(&self, x: f64, y: f64, button: String, stream: u32) -> Result<(), Error> {
+        let _call = self.admit()?;
+        finite(&[x, y])?;
+        let code = crate::keys::button_code(&button)?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.move_to_pixel(stream, x, y)?;
+        portal.click(code)?;
         Ok(())
     }
 
