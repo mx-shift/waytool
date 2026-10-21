@@ -138,8 +138,39 @@ enum Cmd {
         stream: u32,
     },
 
+    /// Move the pointer by a relative delta, for apps that lock the pointer.
+    ///
+    /// DX and DY are in logical pixels. When the focused app holds a
+    /// pointer lock (86Box with the guest mouse captured, MartyPC, games)
+    /// the compositor pins the pointer and passes the app relative motion,
+    /// so `move` does nothing there. Guest mice are relative too, so steer
+    /// by deltas and check with a `screenshot`.
+    MoveRel {
+        /// Horizontal delta.
+        dx: f64,
+        /// Vertical delta.
+        dy: f64,
+    },
+
     /// Press and release a pointer button where the pointer is.
     Click {
+        /// left, right, middle, back or forward.
+        #[arg(long, default_value = "left")]
+        button: String,
+    },
+
+    /// Press a pointer button and hold it until a matching `button-up`.
+    ///
+    /// For drag and drop, and classic Mac menus: `button-down`, `move` the
+    /// pointer, then `button-up` over the target.
+    ButtonDown {
+        /// left, right, middle, back or forward.
+        #[arg(long, default_value = "left")]
+        button: String,
+    },
+
+    /// Release a pointer button held with `button-down`.
+    ButtonUp {
         /// left, right, middle, back or forward.
         #[arg(long, default_value = "left")]
         button: String,
@@ -219,7 +250,10 @@ async fn call(cmd: Cmd) -> Result<()> {
             .await
             .map_err(protocol::describe)?,
         Cmd::Move { x, y, stream } => d.move_to(x, y, stream).await.map_err(protocol::describe)?,
+        Cmd::MoveRel { dx, dy } => d.move_rel(dx, dy).await.map_err(protocol::describe)?,
         Cmd::Click { button } => d.click(&button).await.map_err(protocol::describe)?,
+        Cmd::ButtonDown { button } => d.button_down(&button).await.map_err(protocol::describe)?,
+        Cmd::ButtonUp { button } => d.button_up(&button).await.map_err(protocol::describe)?,
         Cmd::ClickAt {
             x,
             y,

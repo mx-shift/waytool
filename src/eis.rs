@@ -479,6 +479,15 @@ impl Eis {
         })
     }
 
+    /// Relative motion in logical pixels.
+    pub(crate) fn move_rel(&self, dx: f64, dy: f64) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let keep = st.button_device() == Some(Which::Pointer) && !st.held_buttons.is_empty();
+        self.emit::<ei::Pointer>(&mut st, Which::Pointer, keep, |pointer| {
+            pointer.motion_relative(dx as f32, dy as f32);
+        })
+    }
+
     /// Absolute motion to global logical coordinates, which must fall
     /// inside one of the absolute device's regions.
     pub(crate) fn move_abs(&self, x: f64, y: f64) -> Result<()> {

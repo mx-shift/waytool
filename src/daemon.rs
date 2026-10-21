@@ -439,11 +439,39 @@ impl Service {
         Ok(())
     }
 
+    /// Relative pointer motion, dx/dy in logical pixels. Absolute moves
+    /// do nothing once an app holds a pointer lock (86Box with the guest
+    /// mouse captured, games): the compositor pins the pointer and hands
+    /// the app relative motion only.
+    async fn move_rel(&self, dx: f64, dy: f64) -> Result<(), Error> {
+        let _call = self.admit()?;
+        finite(&[dx, dy])?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.move_rel(dx, dy)?;
+        Ok(())
+    }
+
     async fn click(&self, button: String) -> Result<(), Error> {
         let _call = self.admit()?;
         let code = crate::keys::button_code(&button)?;
         let (_input, portal) = self.daemon.input().await?;
         portal.click(code)?;
+        Ok(())
+    }
+
+    async fn button_down(&self, button: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let code = crate::keys::button_code(&button)?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.button(code, true)?;
+        Ok(())
+    }
+
+    async fn button_up(&self, button: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let code = crate::keys::button_code(&button)?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.button(code, false)?;
         Ok(())
     }
 

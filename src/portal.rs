@@ -127,6 +127,11 @@ impl Portal {
         self.button(code, false)
     }
 
+    /// Relative pointer motion in logical pixels.
+    pub(crate) fn move_rel(&self, dx: f64, dy: f64) -> Result<()> {
+        self.eis.move_rel(dx, dy)
+    }
+
     /// Move the pointer to screenshot pixel (x, y) of stream index
     /// `stream`.
     pub(crate) fn move_to_pixel(&self, stream: u32, x: f64, y: f64) -> Result<()> {

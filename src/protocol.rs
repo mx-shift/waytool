@@ -110,9 +110,15 @@ pub trait Daemon {
     /// `stream`.
     #[zbus(name = "Move")]
     fn move_to(&self, x: f64, y: f64, stream: u32) -> Result<(), Error>;
+    /// Move the pointer by a relative delta in logical pixels.
+    fn move_rel(&self, dx: f64, dy: f64) -> Result<(), Error>;
     /// Press+release a pointer button (left, right, middle, back,
     /// forward) at the current position.
     fn click(&self, button: &str) -> Result<(), Error>;
+    /// Press and hold a pointer button until a matching ButtonUp.
+    fn button_down(&self, button: &str) -> Result<(), Error>;
+    /// Release a pointer button held with ButtonDown.
+    fn button_up(&self, button: &str) -> Result<(), Error>;
     /// Move to screenshot pixels (x, y) of stream index `stream`, then
     /// click.
     fn click_at(&self, x: f64, y: f64, button: &str, stream: u32) -> Result<(), Error>;
