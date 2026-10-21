@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: shellcheck gnome-extension/install.sh systemd/make-unit.sh
+      - run: shellcheck gnome-extension/install.sh systemd/make-unit.sh tests/integration/*.sh
       - run: npx --yes eslint@10.12.0 gnome-extension
 
   # Portable binaries. Built on Debian 12, the oldest base the pipewire
@@ -136,6 +136,32 @@ jobs:
         with:
           name: binary-${{ matrix.arch }}
           path: dist/*
+
+  # End to end on a real compositor: the Wayland-protocol backend on
+  # headless sway, typing into foot, capturing both outputs and moving
+  # the pointer on a scaled one (tests/integration/sway.sh).
+  sway:
+    name: end-to-end on headless sway
+    needs: binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+      # sway carries a file capability, which needs SYS_NICE to exec.
+      options: --cap-add SYS_NICE
+    steps:
+      - name: Install sway and the test clients
+        run: dnf install -y --setopt=install_weak_deps=False sway foot wev dbus-daemon pipewire-libs libxkbcommon xkeyboard-config gawk tar gzip findutils
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binary-x86_64
+          path: dist
+      - name: Install the binary
+        run: tar -xzf dist/*.tar.gz --strip-components=1 -C /usr/local/bin --wildcards '*/waytool'
+      - run: tests/integration/sway.sh
 
   deb:
     name: deb (${{ matrix.arch }})
