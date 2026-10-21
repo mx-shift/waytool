@@ -4,7 +4,7 @@
 //! - `waytool daemon` establishes one RemoteDesktop portal session,
 //!   connects its input through libei (`eis`), then serves the D-Bus
 //!   interface in `protocol` peer-to-peer on a unix socket.
-//! - All other subcommands (`ping`, `key`)
+//! - All other subcommands (`key`, `key-chord`, ...)
 //!   are thin clients that connect to the socket and make one call.
 //!
 //! Why a daemon: a portal session costs a consent dialog. The portal's
@@ -218,6 +218,29 @@ fn keysym(name: &str) -> Result<u32> {
         .ok_or_else(|| anyhow!("unknown key name {name:?} (see `waytool key --help`)"))
 }
 
+/// Press `syms` in order, then release them in reverse so the first
+/// (the modifier) is the last to come up — the held-modifier discipline
+/// emulators expect. If a press fails, the keys already down are still
+/// released, so an error never leaves a modifier stuck.
+async fn key_chord(portal: &Portal, syms: &[u32]) -> Result<()> {
+    let mut pressed = 0;
+    let mut result = Ok(());
+    for sym in syms {
+        if let Err(e) = portal.keysym(*sym, true) {
+            result = Err(e);
+            break;
+        }
+        pressed += 1;
+    }
+    for sym in syms[..pressed].iter().rev() {
+        let released = portal.keysym(*sym, false);
+        if result.is_ok() {
+            result = released;
+        }
+    }
+    result
+}
+
 /// The daemon's D-Bus interface (see `protocol`). One instance is
 /// served on each client connection, all sharing the daemon state.
 ///
@@ -255,6 +278,49 @@ impl Service {
         let sym = keysym(&name)?;
         let (_input, portal) = self.daemon.input().await?;
         portal.tap_keysym(sym)?;
+        Ok(())
+    }
+
+    async fn key_chord(&self, keys: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let syms: Vec<u32> = keys
+            .split('+')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                crate::keys::keysym_from_name(p).ok_or_else(|| {
+                    anyhow!("unknown key name {p:?} in the chord (see `waytool key --help`)")
+                })
+            })
+            .collect::<Result<_>>()?;
+        if syms.is_empty() {
+            return Err(anyhow!("empty chord").into());
+        }
+        let (_input, portal) = self.daemon.input().await?;
+        key_chord(&portal, &syms).await?;
+        Ok(())
+    }
+
+    async fn key_code(&self, code: i32) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let code = u32::try_from(code).map_err(|_| anyhow!("keycode {code} is negative"))?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.tap_keycode(code)?;
+        Ok(())
+    }
+
+    async fn key_down(&self, name: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let sym = keysym(&name)?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.keysym(sym, true)?;
+        Ok(())
+    }
+
+    async fn key_up(&self, name: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        let sym = keysym(&name)?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.keysym(sym, false)?;
         Ok(())
     }
 }

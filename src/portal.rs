@@ -51,6 +51,12 @@ impl Portal {
         self.keysym(keysym, true)?;
         self.keysym(keysym, false)
     }
+
+    /// Press and release a Linux evdev keycode.
+    pub(crate) fn tap_keycode(&self, code: u32) -> Result<()> {
+        self.eis.keycode(code, true)?;
+        self.eis.keycode(code, false)
+    }
 }
 
 /// Connect the session's input through libei.

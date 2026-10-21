@@ -35,6 +35,11 @@ use xkbcommon::xkb;
 /// resume the devices.
 const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// One past the highest evdev code (KEY_CNT in linux/input-event-codes.h).
+/// A key code outside the range is a protocol error that ends
+/// the whole libei connection, so it's refused before it's sent.
+const KEY_CNT: u32 = 0x300;
+
 /// How a key's type maps modifiers to levels: each listed modifier
 /// combination (masked by `mask`) selects its level, anything else
 /// selects level 0. This is the key type's `map` from the keymap.
@@ -350,6 +355,20 @@ impl Eis {
         }
     }
 
+    /// Press or release an evdev keycode as is.
+    pub(crate) fn keycode(&self, code: u32, press: bool) -> Result<()> {
+        check_code(code)?;
+        let mut st = self.state.lock().unwrap();
+        if press {
+            if st.held_keys.contains_key(&code) {
+                return Ok(());
+            }
+            self.press_key(&mut st, code, Vec::new())
+        } else {
+            self.release_key(&mut st, code)
+        }
+    }
+
     fn press_key(&self, st: &mut State, key: u32, modifiers: Vec<u32>) -> Result<()> {
         let new: Vec<u32> = modifiers
             .iter()
@@ -391,6 +410,16 @@ impl Eis {
             }
         })
     }
+}
+
+fn check_code(code: u32) -> Result<()> {
+    if code >= KEY_CNT {
+        return Err(anyhow!(
+            "evdev code {code} is out of range (codes go up to {})",
+            KEY_CNT - 1
+        ));
+    }
+    Ok(())
 }
 
 /// The libei thread: handshake, then keep `state` up to date from the

@@ -2,7 +2,7 @@
 //! freedesktop RemoteDesktop portal.
 //!
 //! Architecture: one persistent daemon owns the session; every other
-//! subcommand (`ping`, `key`) is a thin
+//! subcommand (`key`, `key-chord`, ...) is a thin
 //! client that connects to `$XDG_RUNTIME_DIR/waytool.sock` and
 //! makes one D-Bus call (see `protocol`).
 //!
@@ -59,6 +59,39 @@ enum Cmd {
         /// character.
         name: String,
     },
+
+    /// Press keys in order, then release them in reverse.
+    ///
+    /// The held-modifier pattern emulators expect: `Ctrl+F4` holds Ctrl
+    /// while F4 goes down and up. Use it for shortcuts like DOSBox-X's
+    /// swap-floppy hotkey, and anything that tells a held modifier from
+    /// two separate presses.
+    KeyChord {
+        /// Key names (as for `key`) joined with `+`, e.g. `Ctrl+F4`.
+        keys: String,
+    },
+
+    /// Press and release a Linux evdev keycode, as is.
+    KeyCode {
+        /// The evdev code (linux/input-event-codes.h), 0 to 767.
+        code: i32,
+    },
+
+    /// Press a key and hold it until a matching `key-up`.
+    ///
+    /// For apps that tell a held key (pinball plungers, accelerating
+    /// cursors) from a tap. Keys pressed with it to reach its level are
+    /// released with it.
+    KeyDown {
+        /// A key name, as for `key`.
+        name: String,
+    },
+
+    /// Release a key held with `key-down`.
+    KeyUp {
+        /// A key name, as for `key`.
+        name: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -79,6 +112,10 @@ async fn call(cmd: Cmd) -> Result<()> {
             println!("pong");
         }
         Cmd::Key { name } => d.key(&name).await.map_err(protocol::describe)?,
+        Cmd::KeyChord { keys } => d.key_chord(&keys).await.map_err(protocol::describe)?,
+        Cmd::KeyCode { code } => d.key_code(code).await.map_err(protocol::describe)?,
+        Cmd::KeyDown { name } => d.key_down(&name).await.map_err(protocol::describe)?,
+        Cmd::KeyUp { name } => d.key_up(&name).await.map_err(protocol::describe)?,
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())

@@ -71,6 +71,15 @@ pub trait Daemon {
 
     /// Press+release a single keysym by name (space, Return, a, ...).
     fn key(&self, name: &str) -> Result<(), Error>;
+    /// Press a chord of keysyms separated by '+', left to right, then
+    /// release them in reverse.
+    fn key_chord(&self, keys: &str) -> Result<(), Error>;
+    /// Press+release a Linux evdev keycode.
+    fn key_code(&self, code: i32) -> Result<(), Error>;
+    /// Press and hold a keysym until a matching KeyUp.
+    fn key_down(&self, name: &str) -> Result<(), Error>;
+    /// Release a keysym held with KeyDown.
+    fn key_up(&self, name: &str) -> Result<(), Error>;
 }
 
 /// Connect to the running daemon.
@@ -144,6 +153,9 @@ mod tests {
 
         let err = describe(d.key("nope").await.unwrap_err()).to_string();
         assert_eq!(err, "unknown keysym \"nope\"");
+
+        let err = describe(d.key_up("a").await.unwrap_err()).to_string();
+        assert!(err.contains("restart it"), "{err}");
 
         // The server side finishes once the client hangs up.
         drop(d);
