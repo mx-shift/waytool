@@ -21,6 +21,7 @@ mod daemon;
 mod display;
 mod eis;
 mod extension;
+mod keymap;
 mod keys;
 mod portal;
 mod protocol;

@@ -20,7 +20,7 @@
 //! keysym that isn't on the layout can't be sent as a key at all; see
 //! `daemon::type_text` for how those are typed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
@@ -30,116 +30,12 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use reis::ei;
 use reis::event::{Device, DeviceCapability, EiEvent};
-use xkbcommon::xkb;
+
+use crate::keymap::{Events, Keys, Layout, canonical, check_code};
 
 /// How long to wait after connecting for the compositor to offer and
 /// resume the devices.
 const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// One past the highest evdev code (KEY_CNT in linux/input-event-codes.h).
-/// A key or button code outside the range is a protocol error that ends
-/// the whole libei connection, so it's refused before it's sent.
-const KEY_CNT: u32 = 0x300;
-
-/// How a key's type maps modifiers to levels: each listed modifier
-/// combination (masked by `mask`) selects its level, anything else
-/// selects level 0. This is the key type's `map` from the keymap.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct KeyType {
-    map: Vec<(u32, u32)>,
-    mask: u32,
-}
-
-impl KeyType {
-    fn level_for(&self, mods: u32) -> u32 {
-        let mods = mods & self.mask;
-        self.map
-            .iter()
-            .find(|(m, _)| *m == mods)
-            .map_or(0, |(_, level)| *level)
-    }
-}
-
-/// One layout (group) of the keymap, indexed for typing.
-#[derive(Default)]
-struct Layout {
-    /// Every place each keysym is on, as (evdev keycode, level), lowest
-    /// keycode first. Keysyms are stored canonically (see `canonical`).
-    places: HashMap<u32, Vec<(u32, u32)>>,
-    /// Each key's type.
-    types: HashMap<u32, KeyType>,
-    /// The modifier keys that can be pressed to select a level, with the
-    /// modifier mask each sets. Lock keys aren't among them: pressing
-    /// one would toggle state rather than hold it.
-    modifiers: Vec<(u32, u32)>,
-}
-
-impl Layout {
-    /// The modifier mask that the modifier key `code` sets, if it's one.
-    fn modifier_mask(&self, code: u32) -> u32 {
-        self.modifiers
-            .iter()
-            .find(|(c, _)| *c == code)
-            .map_or(0, |(_, m)| *m)
-    }
-
-    /// How to type `keysym` when the modifiers in `active` are already
-    /// in effect: its key, and the modifier keys to press with it. The
-    /// lowest keycode it can be reached on wins. If no place can be
-    /// reached — a modifier the caller holds on purpose selects another
-    /// level — its key is pressed with nothing added, so the held
-    /// modifier applies, as a chord like Shift+a means. None if the
-    /// keysym isn't on the layout.
-    fn press_for(&self, keysym: u32, active: u32) -> Option<(u32, Vec<u32>)> {
-        let places = self.places.get(&canonical(keysym))?;
-        places
-            .iter()
-            .find_map(|&(key, level)| {
-                let ty = self.types.get(&key)?;
-                Some((key, self.modifier_keys_for(ty, level, active)?))
-            })
-            .or_else(|| Some((places[0].0, Vec::new())))
-    }
-
-    /// The fewest modifier keys that, added to `active`, select `level`
-    /// on a key of type `ty`. Modifiers can only be added, so a locked
-    /// one (Caps Lock, say) is worked around rather than undone.
-    fn modifier_keys_for(&self, ty: &KeyType, level: u32, active: u32) -> Option<Vec<u32>> {
-        let usable: Vec<(u32, u32)> = self
-            .modifiers
-            .iter()
-            .copied()
-            .filter(|(_, m)| m & active == 0 && m & ty.mask != 0)
-            .collect();
-        let mut subsets: Vec<u32> = (0..1u32 << usable.len()).collect();
-        subsets.sort_by_key(|s| s.count_ones());
-        subsets.into_iter().find_map(|subset| {
-            let (mods, keys) = usable
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| subset & (1 << i) != 0)
-                .fold((active, Vec::new()), |(mods, mut keys), (_, (code, m))| {
-                    keys.push(*code);
-                    (mods | m, keys)
-                });
-            (ty.level_for(mods) == level).then_some(keys)
-        })
-    }
-}
-
-/// A keysym in the form the keymap uses. A character can be written
-/// either as its legacy keysym (EuroSign, Cyrillic_a) or as the Unicode
-/// keysym 0x01000000 + code point; XKB keymaps use the legacy one where
-/// it exists, so Unicode keysyms are mapped to it.
-fn canonical(keysym: u32) -> u32 {
-    if keysym & 0xff00_0000 == 0x0100_0000 {
-        let sym = xkb::utf32_to_keysym(keysym & 0x00ff_ffff).raw();
-        if sym != 0 {
-            return sym;
-        }
-    }
-    keysym
-}
 
 /// One device the compositor offered.
 struct Slot {
@@ -176,16 +72,14 @@ struct State {
     keyboard: Option<Slot>,
     /// The keyboard's keymap, one entry per layout.
     layouts: Vec<Layout>,
+    /// The keys we hold on the keyboard.
+    keys: Keys,
     /// The keyboard's active layout and locked modifiers, from its
     /// modifiers events. Depressed modifiers aren't tracked from there:
-    /// those events trail our own presses, so `held_keys` is the record
-    /// of what we hold.
+    /// those events trail our own presses, so `keys` is the record of
+    /// what we hold.
     group: u32,
     locked: u32,
-    /// Keys we hold down, each with the modifier keys pressed for it.
-    held_keys: HashMap<u32, Vec<u32>>,
-    /// How many held keys each modifier key we pressed is down for.
-    modifier_holds: HashMap<u32, u32>,
     /// Buttons we hold down.
     held_buttons: HashSet<u32>,
     disconnected: Option<String>,
@@ -230,25 +124,23 @@ impl State {
 
     /// The current layout, or why there's none to type with.
     fn layout(&self) -> Result<&Layout> {
-        if self.keyboard.is_none() {
-            return Err(anyhow!("the compositor offered no keyboard device"));
-        }
-        self.layouts.get(self.group as usize).ok_or_else(|| {
-            anyhow!(
-                "no keymap for keyboard layout {} (the compositor's keymap didn't load)",
-                self.group
-            )
-        })
+        current_layout(&self.keyboard, &self.layouts, self.group)
     }
+}
 
-    /// The modifiers in effect for choosing a level: those locked, plus
-    /// those of the modifier keys we hold.
-    fn active_modifiers(&self, layout: &Layout) -> u32 {
-        self.held_keys
-            .keys()
-            .chain(self.modifier_holds.keys())
-            .fold(self.locked, |mods, code| mods | layout.modifier_mask(*code))
+/// The layout to type with, or why there's none. A free function so
+/// callers can hold it while changing the other fields of `State`.
+fn current_layout<'a>(
+    keyboard: &Option<Slot>,
+    layouts: &'a [Layout],
+    group: u32,
+) -> Result<&'a Layout> {
+    if keyboard.is_none() {
+        return Err(anyhow!("the compositor offered no keyboard device"));
     }
+    layouts.get(group as usize).ok_or_else(|| {
+        anyhow!("no keymap for keyboard layout {group} (the compositor's keymap didn't load)")
+    })
 }
 
 /// A connected libei sender context.
@@ -385,88 +277,42 @@ impl Eis {
     /// release lets go of the key and of exactly the modifiers its press
     /// added (unless another held key still needs them).
     pub(crate) fn keysym(&self, keysym: u32, press: bool) -> Result<()> {
-        let mut st = self.state.lock().unwrap();
-        let layout = st.layout()?;
-        let not_on_layout = || {
-            anyhow!(
-                "keysym {} ({keysym:#x}) isn't on the current keyboard layout",
-                xkb::keysym_get_name(xkb::Keysym::new(keysym))
-            )
-        };
-        if press {
-            let active = st.active_modifiers(layout);
-            let (key, modifiers) = layout.press_for(keysym, active).ok_or_else(not_on_layout)?;
-            if st.held_keys.contains_key(&key) {
-                return Ok(());
-            }
-            self.press_key(&mut st, key, modifiers)
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        let layout = current_layout(&st.keyboard, &st.layouts, st.group)?;
+        let events = if press {
+            st.keys.press_keysym(layout, keysym, st.locked)?
         } else {
-            // The key it was pressed on, if it's held.
-            let places = layout
-                .places
-                .get(&canonical(keysym))
-                .ok_or_else(not_on_layout)?;
-            let key = places
-                .iter()
-                .map(|(key, _)| *key)
-                .find(|key| st.held_keys.contains_key(key))
-                .unwrap_or(places[0].0);
-            self.release_key(&mut st, key)
-        }
+            st.keys.release_keysym(layout, keysym)?
+        };
+        self.send_keys(st, events)
     }
 
     /// Press or release an evdev keycode as is.
     pub(crate) fn keycode(&self, code: u32, press: bool) -> Result<()> {
         check_code(code)?;
         let mut st = self.state.lock().unwrap();
-        if press {
-            if st.held_keys.contains_key(&code) {
-                return Ok(());
-            }
-            self.press_key(&mut st, code, Vec::new())
+        let events = if press {
+            st.keys.press_code(code)
         } else {
-            self.release_key(&mut st, code)
-        }
+            st.keys.release_code(code)
+        };
+        self.send_keys(&mut st, events)
     }
 
-    fn press_key(&self, st: &mut State, key: u32, modifiers: Vec<u32>) -> Result<()> {
-        let new: Vec<u32> = modifiers
-            .iter()
-            .copied()
-            .filter(|m| !st.modifier_holds.contains_key(m) && !st.held_keys.contains_key(m))
-            .collect();
-        self.emit::<ei::Keyboard>(st, Which::Keyboard, true, |keyboard| {
-            for m in &new {
-                keyboard.key(*m, ei::keyboard::KeyState::Press);
-            }
-            keyboard.key(key, ei::keyboard::KeyState::Press);
-        })?;
-        for m in &modifiers {
-            *st.modifier_holds.entry(*m).or_default() += 1;
+    fn send_keys(&self, st: &mut State, events: Events) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
         }
-        st.held_keys.insert(key, modifiers);
-        Ok(())
-    }
-
-    fn release_key(&self, st: &mut State, key: u32) -> Result<()> {
-        let modifiers = st.held_keys.remove(&key).unwrap_or_default();
-        let mut up = Vec::new();
-        for m in modifiers {
-            if let Some(n) = st.modifier_holds.get_mut(&m) {
-                *n -= 1;
-                if *n == 0 {
-                    st.modifier_holds.remove(&m);
-                    if !st.held_keys.contains_key(&m) {
-                        up.push(m);
-                    }
-                }
-            }
-        }
-        let keep = !st.held_keys.is_empty();
+        let keep = !st.keys.is_empty();
         self.emit::<ei::Keyboard>(st, Which::Keyboard, keep, |keyboard| {
-            keyboard.key(key, ei::keyboard::KeyState::Released);
-            for m in up.iter().rev() {
-                keyboard.key(*m, ei::keyboard::KeyState::Released);
+            for (code, press) in events {
+                let state = if press {
+                    ei::keyboard::KeyState::Press
+                } else {
+                    ei::keyboard::KeyState::Released
+                };
+                keyboard.key(code, state);
             }
         })
     }
@@ -560,16 +406,6 @@ impl Eis {
                 .any(|r| Region::from(r).contains(x, y))
         })
     }
-}
-
-fn check_code(code: u32) -> Result<()> {
-    if code >= KEY_CNT {
-        return Err(anyhow!(
-            "evdev code {code} is out of range (codes go up to {})",
-            KEY_CNT - 1
-        ));
-    }
-    Ok(())
 }
 
 /// An absolute device's region: a monitor's logical rect and scale.
@@ -707,8 +543,7 @@ fn handle_event(st: &mut State, event: EiEvent) {
                 };
                 // A new keyboard (the compositor re-adds it when the
                 // keymap changes) holds nothing.
-                st.held_keys.clear();
-                st.modifier_holds.clear();
+                st.keys.clear();
                 st.keyboard = slot;
             } else if device.has_capability(DeviceCapability::PointerAbsolute) {
                 st.absolute = slot;
@@ -761,89 +596,7 @@ fn load_keymap(keymap: &reis::event::Keymap) -> Result<Vec<Layout>> {
     while buf.last() == Some(&0) {
         buf.pop();
     }
-    let text = String::from_utf8(buf).context("keymap isn't UTF-8")?;
-    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkb::Keymap::new_from_string(
-        &context,
-        text,
-        xkb::KEYMAP_FORMAT_TEXT_V1,
-        xkb::COMPILE_NO_FLAGS,
-    )
-    .ok_or_else(|| anyhow!("couldn't compile the keymap"))?;
-    Ok(index_keymap(&keymap))
-}
-
-/// Keysyms of the keys that can supply a modifier for a level, most
-/// preferred first. Lock-style modifiers (Caps Lock, Num Lock) are left
-/// out: pressing them would toggle state.
-const MODIFIER_KEYSYMS: &[u32] = &[
-    xkb::keysyms::KEY_Shift_L,
-    xkb::keysyms::KEY_Shift_R,
-    xkb::keysyms::KEY_ISO_Level3_Shift,
-    xkb::keysyms::KEY_Mode_switch,
-    xkb::keysyms::KEY_ISO_Level5_Shift,
-    xkb::keysyms::KEY_Control_L,
-    xkb::keysyms::KEY_Alt_L,
-    xkb::keysyms::KEY_Super_L,
-];
-
-/// Index each layout of `keymap`: where every keysym is, each key's
-/// type, and the modifier keys. Keycodes are stored as evdev codes
-/// (XKB keycode − 8).
-fn index_keymap(keymap: &xkb::Keymap) -> Vec<Layout> {
-    let keycodes = keymap.min_keycode().raw()..=keymap.max_keycode().raw();
-    (0..keymap.num_layouts())
-        .map(|layout| {
-            let mut out = Layout::default();
-            for &sym in MODIFIER_KEYSYMS {
-                let Some(code) = keycodes.clone().find(|&k| {
-                    keymap
-                        .key_get_syms_by_level(xkb::Keycode::new(k), layout, 0)
-                        .iter()
-                        .any(|s| s.raw() == sym)
-                }) else {
-                    continue;
-                };
-                // The modifier mask the key sets while held.
-                let mut state = xkb::State::new(keymap);
-                state.update_mask(0, 0, 0, 0, 0, layout);
-                state.update_key(xkb::Keycode::new(code), xkb::KeyDirection::Down);
-                let mask = state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
-                if mask != 0 && !out.modifiers.iter().any(|(_, m)| *m == mask) {
-                    out.modifiers.push((code - 8, mask));
-                }
-            }
-
-            for k in keycodes.clone() {
-                let keycode = xkb::Keycode::new(k);
-                let levels = keymap.num_levels_for_key(keycode, layout);
-                if levels == 0 || k < 8 {
-                    continue;
-                }
-                let mut ty = KeyType::default();
-                for level in 0..levels {
-                    let mut masks = [0u32; 16];
-                    let n = keymap.key_get_mods_for_level(keycode, layout, level, &mut masks);
-                    for &mask in &masks[..n] {
-                        ty.mask |= mask;
-                        if mask != 0 || level != 0 {
-                            ty.map.push((mask, level));
-                        }
-                    }
-                    // A level that produces several keysyms types none
-                    // of them on its own.
-                    if let [sym] = keymap.key_get_syms_by_level(keycode, layout, level) {
-                        out.places
-                            .entry(canonical(sym.raw()))
-                            .or_default()
-                            .push((k - 8, level));
-                    }
-                }
-                out.types.insert(k - 8, ty);
-            }
-            out
-        })
-        .collect()
+    crate::keymap::compile(String::from_utf8(buf).context("keymap isn't UTF-8")?)
 }
 
 /// CLOCK_MONOTONIC in microseconds, for frame timestamps.
@@ -861,97 +614,6 @@ fn now_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A small US-style keymap with Shift, Caps Lock and an AltGr level,
-    /// plus `less` on both the comma key and the ISO 102nd key, compiled
-    /// from source so the test doesn't depend on the system's XKB data.
-    fn layout() -> Layout {
-        let source = r#"
-            xkb_keymap {
-                xkb_keycodes { minimum = 8; maximum = 255;
-                    <AC01> = 38; <AB08> = 59; <AB10> = 61; <LSGT> = 94;
-                    <LFSH> = 50; <CAPS> = 66; <RALT> = 108; <SPCE> = 65; <AE04> = 13; };
-                xkb_types { include "complete" };
-                xkb_compat { include "complete" };
-                xkb_symbols {
-                    key <AC01> { type = "FOUR_LEVEL_ALPHABETIC", [ a, A, aacute, Aacute ] };
-                    key <AB08> { [ comma, less ] };
-                    key <AB10> { [ slash, question ] };
-                    key <LSGT> { [ less, greater ] };
-                    key <AE04> { type = "FOUR_LEVEL", [ 4, dollar, EuroSign, cent ] };
-                    key <SPCE> { [ space ] };
-                    key <LFSH> { [ Shift_L ] };
-                    key <CAPS> { [ Caps_Lock ] };
-                    key <RALT> { type = "ONE_LEVEL", [ ISO_Level3_Shift ] };
-                    modifier_map Shift { <LFSH> };
-                    modifier_map Lock { <CAPS> };
-                    modifier_map Mod5 { <RALT> };
-                };
-            };
-        "#;
-        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap = xkb::Keymap::new_from_string(
-            &context,
-            source.into(),
-            xkb::KEYMAP_FORMAT_TEXT_V1,
-            xkb::COMPILE_NO_FLAGS,
-        )
-        .expect("test keymap compiles");
-        index_keymap(&keymap).remove(0)
-    }
-
-    const SHIFT: u32 = 50 - 8;
-    const ALTGR: u32 = 108 - 8;
-    const A: u32 = 38 - 8;
-    const LOCK: u32 = 1 << 1;
-
-    #[test]
-    fn keysyms_map_to_keys_and_level_modifiers() {
-        let l = layout();
-        let press = |sym| l.press_for(sym, 0);
-        assert_eq!(press(0x61), Some((A, vec![])));
-        assert_eq!(press(0x41), Some((A, vec![SHIFT])));
-        assert_eq!(press(0xe1), Some((A, vec![ALTGR])));
-        assert_eq!(press(0xc1), Some((A, vec![SHIFT, ALTGR])));
-        assert_eq!(press(0x3f), Some((61 - 8, vec![SHIFT])));
-        // Not on the layout.
-        assert_eq!(press(0x1f600 | 0x0100_0000), None);
-    }
-
-    #[test]
-    fn caps_lock_is_worked_around() {
-        let l = layout();
-        // With Caps Lock on, a bare A key types "A", so "a" needs Shift
-        // and "A" needs nothing.
-        assert_eq!(l.press_for(0x61, LOCK), Some((A, vec![SHIFT])));
-        assert_eq!(l.press_for(0x41, LOCK), Some((A, vec![])));
-    }
-
-    #[test]
-    fn a_held_modifier_is_not_pressed_again() {
-        let l = layout();
-        let shift = l.modifier_mask(SHIFT);
-        assert_eq!(l.press_for(0x41, shift), Some((A, vec![])));
-        // Shift held on purpose, then "b"-style lowercase: the key goes
-        // down with the held Shift applying, as a chord means.
-        assert_eq!(l.press_for(0x61, shift), Some((A, vec![])));
-    }
-
-    #[test]
-    fn the_lowest_keycode_wins() {
-        // `less` is on the comma key (Shift) and on the ISO 102nd key
-        // (no modifier); US keyboards have only the first.
-        assert_eq!(layout().press_for(0x3c, 0), Some((59 - 8, vec![SHIFT])));
-    }
-
-    #[test]
-    fn unicode_keysyms_find_legacy_ones() {
-        // U+20AC is EuroSign (0x20ac) in the keymap.
-        assert_eq!(
-            layout().press_for(0x0100_20ac, 0),
-            Some((13 - 8, vec![ALTGR]))
-        );
-    }
 
     #[test]
     fn regions_map_pixels_into_logical_space() {
