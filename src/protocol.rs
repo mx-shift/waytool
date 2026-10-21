@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use tokio::net::UnixStream;
+use zvariant::{DeserializeDict, SerializeDict, Type};
 
 /// The one object the daemon serves. Its interface is
 /// `com.mxshift.Waytool.Daemon1`, spelled out in the proxy below
@@ -56,6 +57,16 @@ impl From<anyhow::Error> for Error {
     }
 }
 
+/// One portal stream (a monitor). `position`/`size` are its rect in
+/// global logical coordinates, when the portal reported one.
+#[derive(Debug, SerializeDict, DeserializeDict, Type)]
+#[zvariant(signature = "dict")]
+pub struct StreamDesc {
+    pub node_id: u32,
+    pub position: Option<(i32, i32)>,
+    pub size: Option<(i32, i32)>,
+}
+
 /// Client side of the daemon interface. The `default_service` is
 /// required by the proxy machinery but means nothing on a
 /// peer-to-peer connection; the daemon ignores the destination.
@@ -84,6 +95,11 @@ pub trait Daemon {
     /// `delay_ms` waits after each character and `hold_ms` keeps each
     /// key down; 0 means no wait.
     fn type_text(&self, text: &str, delay_ms: u32, hold_ms: u32) -> Result<(), Error>;
+
+    /// The portal streams, in index order.
+    fn streams(&self) -> Result<Vec<StreamDesc>, Error>;
+    /// Index of the stream whose rect covers global point (x, y).
+    fn stream_at(&self, x: f64, y: f64) -> Result<u32, Error>;
 }
 
 /// Connect to the running daemon.
@@ -102,7 +118,7 @@ async fn connect_stream(stream: UnixStream) -> Result<DaemonProxy<'static>> {
     let handshake = zbus::connection::Builder::unix_stream(stream).p2p().build();
     let conn = tokio::time::timeout(std::time::Duration::from_secs(10), handshake)
         .await
-        .context("the daemon isn't answering — is it still waiting for consent?")?
+        .context("the daemon isn't answering — is it still waiting for screen-sharing consent?")?
         .context("D-Bus handshake with the daemon")?;
     DaemonProxy::new(&conn).await.context("daemon proxy")
 }
@@ -145,6 +161,14 @@ mod tests {
         async fn key(&self, name: String) -> Result<(), Error> {
             Err(anyhow!("unknown keysym {name:?}").into())
         }
+
+        async fn streams(&self) -> Vec<StreamDesc> {
+            vec![StreamDesc {
+                node_id: 42,
+                position: Some((-1920, 0)),
+                size: None,
+            }]
+        }
     }
 
     #[tokio::test]
@@ -160,6 +184,12 @@ mod tests {
 
         let err = describe(d.key_up("a").await.unwrap_err()).to_string();
         assert!(err.contains("restart it"), "{err}");
+
+        let streams = d.streams().await.unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].node_id, 42);
+        assert_eq!(streams[0].position, Some((-1920, 0)));
+        assert_eq!(streams[0].size, None);
 
         // The server side finishes once the client hangs up.
         drop(d);

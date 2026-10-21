@@ -1,13 +1,13 @@
 //! waytool: command-line keyboard input on Wayland, through the
-//! freedesktop RemoteDesktop portal.
+//! freedesktop RemoteDesktop and ScreenCast portals.
 //!
 //! Architecture: one persistent daemon owns the session; every other
-//! subcommand (`key`, `type`, ...) is a thin
+//! subcommand (`key`, `type`, `streams`, ...) is a thin
 //! client that connects to `$XDG_RUNTIME_DIR/waytool.sock` and
 //! makes one D-Bus call (see `protocol`).
 //!
 //! Run `waytool daemon` in a terminal.
-//! Each start shows the portal's consent dialog — accept it.
+//! Each start shows the screen-sharing consent dialog — accept it.
 //! Commands reuse that session until the daemon exits.
 
 mod daemon;
@@ -24,8 +24,9 @@ use clap::{Parser, Subcommand};
     about = "Keyboard input on Wayland.",
     long_about = "Keyboard input on Wayland.\n\
                   \n\
-                  Input goes through the RemoteDesktop portal, which needs libei (GNOME 45+, \
-                  KDE Plasma 6.1+, COSMIC); the daemon asks for consent when it starts.\n\
+                  Input goes through the RemoteDesktop and ScreenCast portals, \
+                  which need libei (GNOME 45+, KDE Plasma 6.1+, COSMIC); the daemon asks for \
+                  screen-sharing consent when it starts.\n\
                   \n\
                   Every command except `daemon` talks to the running daemon, so start it first \
                   with `waytool daemon`. Commands then return almost at once."
@@ -38,10 +39,10 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /* ----- meta / lifecycle ----- */
-    /// Run the daemon that holds the input session.
+    /// Run the daemon that holds the input and capture session.
     ///
-    /// Each start asks for consent. Other commands reuse the session
-    /// until the daemon exits. Stop it with Ctrl-C.
+    /// Each start asks for screen-sharing consent. Other commands reuse
+    /// the session until the daemon exits. Stop it with Ctrl-C.
     Daemon,
 
     /// Check that the daemon is up; prints `pong`.
@@ -114,6 +115,24 @@ enum Cmd {
         #[arg(long)]
         hold: Option<u32>,
     },
+
+    /* ----- capture ----- */
+    /// List the capture streams: index, PipeWire node, position and size.
+    ///
+    /// These are the monitors shared in the consent dialog, each with its
+    /// PipeWire node. Position and size are the monitor's rect in global
+    /// logical coordinates.
+    Streams,
+
+    /// Print which stream covers a global logical point.
+    ///
+    /// Useful for turning a global point into the stream that shows it.
+    StreamAt {
+        /// Global logical x.
+        x: f64,
+        /// Global logical y.
+        y: f64,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -142,6 +161,28 @@ async fn call(cmd: Cmd) -> Result<()> {
             .type_text(&text, delay.unwrap_or(0), hold.unwrap_or(0))
             .await
             .map_err(protocol::describe)?,
+        Cmd::Streams => {
+            let streams = d.streams().await.map_err(protocol::describe)?;
+            if streams.is_empty() {
+                println!("no streams");
+            } else {
+                println!("idx\tnode\tpos\tsize");
+            }
+            for (i, s) in streams.iter().enumerate() {
+                let pos = s
+                    .position
+                    .map(|(x, y)| format!("{x},{y}"))
+                    .unwrap_or_else(|| "?".into());
+                let size = s
+                    .size
+                    .map(|(w, h)| format!("{w}x{h}"))
+                    .unwrap_or_else(|| "?".into());
+                println!("{i}\t{}\t{pos}\t{size}", s.node_id);
+            }
+        }
+        Cmd::StreamAt { x, y } => {
+            println!("{}", d.stream_at(x, y).await.map_err(protocol::describe)?);
+        }
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())

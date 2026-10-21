@@ -979,9 +979,11 @@ dependencies = [
  "futures-util",
  "libc",
  "reis",
+ "serde",
  "tokio",
  "xkbcommon",
  "zbus",
+ "zvariant",
 ]
 
 [[package]]

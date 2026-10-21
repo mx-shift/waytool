@@ -1,10 +1,11 @@
 //! Daemon mode for waytool.
 //!
 //! Architecture:
-//! - `waytool daemon` establishes one RemoteDesktop portal session,
-//!   connects its input through libei (`eis`), then serves the D-Bus
-//!   interface in `protocol` peer-to-peer on a unix socket.
-//! - All other subcommands (`key`, `type`, ...)
+//! - `waytool daemon` establishes one RemoteDesktop + ScreenCast
+//!   portal session, connects its input through libei (`eis`), then
+//!   serves the D-Bus interface in `protocol` peer-to-peer on a unix
+//!   socket.
+//! - All other subcommands (`key`, `type`, `streams`, ...)
 //!   are thin clients that connect to the socket and make one call.
 //!
 //! Why a daemon: a portal session costs a consent dialog. The portal's
@@ -28,7 +29,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::portal::Portal;
-use crate::protocol::Error;
+use crate::protocol::{Error, StreamDesc};
 
 /// State shared by every client connection.
 pub(crate) struct Daemon {
@@ -173,7 +174,10 @@ pub async fn run_daemon() -> Result<()> {
 
     eprintln!("waytool: establishing portal session (consent prompt may appear)...");
     let portal = Arc::new(Portal::establish().await?);
-    eprintln!("waytool: session ready");
+    eprintln!(
+        "waytool: session ready, {} stream(s)",
+        portal.streams().len()
+    );
 
     let daemon = Arc::new(Daemon {
         portal: portal.clone(),
@@ -312,6 +316,18 @@ async fn key_chord(portal: &Portal, syms: &[u32]) -> Result<()> {
     result
 }
 
+/// Reject NaN and infinite coordinates up front: every bounds check
+/// compares false against NaN, so it would otherwise reach the portal.
+fn finite(coords: &[f64]) -> Result<()> {
+    if coords.iter().all(|c| c.is_finite()) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "coordinates must be finite numbers, got {coords:?}"
+        ))
+    }
+}
+
 /// The daemon's D-Bus interface (see `protocol`). One instance is
 /// served on each client connection, all sharing the daemon state.
 ///
@@ -402,6 +418,35 @@ impl Service {
         let hangup = self.hangup.clone();
         type_text(&portal, &text, delay_ms, hold_ms, hangup).await?;
         Ok(())
+    }
+
+    /// The portal streams, in index order.
+    async fn streams(&self) -> Vec<StreamDesc> {
+        self.daemon
+            .portal()
+            .streams()
+            .iter()
+            .map(|s| StreamDesc {
+                node_id: s.node_id,
+                position: s.position,
+                size: s.size,
+            })
+            .collect()
+    }
+
+    /// Index of the stream whose portal-reported rect covers global
+    /// point (x, y).
+    async fn stream_at(&self, x: f64, y: f64) -> Result<u32, Error> {
+        let _call = self.admit()?;
+        finite(&[x, y])?;
+        let idx = self
+            .daemon
+            .portal()
+            .streams()
+            .iter()
+            .position(|s| s.contains(x, y))
+            .ok_or_else(|| anyhow!("no stream covers point ({x}, {y})"))?;
+        Ok(idx as u32)
     }
 }
 
