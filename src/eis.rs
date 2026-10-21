@@ -17,7 +17,8 @@
 //! evdev keycodes, not keysyms, so a keysym is looked up in the XKB
 //! keymap the compositor sends, and the modifier keys that select its
 //! level, given the modifiers already in effect, are pressed with it. A
-//! keysym that isn't on the layout can't be sent as a key at all.
+//! keysym that isn't on the layout can't be sent as a key at all; see
+//! `daemon::type_text` for how those are typed.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;

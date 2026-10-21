@@ -1,8 +1,9 @@
 // waytool gnome-shell extension.
 //
 // Hosts a D-Bus interface (com.mxshift.Waytool) inside gnome-shell
-// so the waytool daemon can enumerate windows and focus them.
-// GNOME's own org.gnome.Shell.Introspect API does the same thing but gates access by hardcoded caller allowlist
+// so the waytool daemon can enumerate windows, focus them, and
+// type text the keyboard layout lacks.  GNOME's own org.gnome.Shell.Introspect API
+// does the same thing but gates access by hardcoded caller allowlist
 // (orca + a few others); regular apps see AccessDenied.  An extension
 // runs inside gnome-shell itself, so it can read the same state
 // directly.
@@ -17,7 +18,9 @@
 // process running a binary named `waytool`, outside any Flatpak
 // sandbox.  That keeps sandboxed apps with session-bus access out; it
 // is not a boundary against unsandboxed code running as you, which can
-// rename a binary, or edit this extension, just as well.
+// rename a binary, or edit this extension, just as well.  Note that
+// CommitText and ForwardKey type without the screen-sharing consent the
+// daemon's own input needs.
 //
 // Methods (see IFACE_XML below):
 //
@@ -42,6 +45,27 @@
 //     switches to its workspace, leaves the overview, raises it and
 //     gives it keyboard focus.  Activation is asynchronous; read the
 //     window back to see whether focus landed.
+//
+//   CanCommitText()           -> b
+//     Whether the focused window takes text input from the input
+//     method (most GTK, Qt and browser windows do; X11 apps don't).
+//
+//   CommitText(s text)        -> b
+//     Types `text` into the focused window through gnome-shell's input
+//     method, the way GNOME's on-screen keyboard types emoji: for
+//     characters that have no key on the keyboard layout, which can't
+//     be sent as key presses.  Returns false, typing nothing, when the
+//     focused window doesn't take text input.  An error while an input
+//     method is composing text, which a commit would garble.
+//
+//   ForwardKey(u keysym, u keycode) -> b
+//     Presses and releases a key (evdev `keycode`, producing `keysym`)
+//     in the focused window through the input method, in order with
+//     CommitText: both go through the same queue (see
+//     clutter_input_method_forward_key), whereas a key from the
+//     daemon's own keyboard device first waits on the input method's
+//     engine.  Returns false when the focused window doesn't take text
+//     input.
 //
 // All ids are Meta.Window.get_id() — a stable uint64 valid for the
 // window's lifetime.
@@ -69,6 +93,18 @@ const IFACE_XML = `
     </method>
     <method name="FocusWindow">
       <arg type="t" direction="in" name="id"/>
+    </method>
+    <method name="CanCommitText">
+      <arg type="b" direction="out" name="can_commit"/>
+    </method>
+    <method name="CommitText">
+      <arg type="s" direction="in" name="text"/>
+      <arg type="b" direction="out" name="committed"/>
+    </method>
+    <method name="ForwardKey">
+      <arg type="u" direction="in" name="keysym"/>
+      <arg type="u" direction="in" name="keycode"/>
+      <arg type="b" direction="out" name="forwarded"/>
     </method>
   </interface>
 </node>`;
@@ -295,6 +331,35 @@ class AgentDBus {
             const active = global.workspace_manager.get_active_workspace_index();
             const ws = w.is_on_all_workspaces() ? active : (w.get_workspace()?.index() ?? active);
             Main.activateWindow(w, time, ws);
+        });
+    }
+
+    CanCommitTextAsync(_params, invocation) {
+        this._serve(invocation, '(b)', () => Main.inputMethod.currentFocus !== null);
+    }
+
+    CommitTextAsync([text], invocation) {
+        this._serve(invocation, '(b)', () => {
+            if (Main.inputMethod.currentFocus === null)
+                return false;
+            if (Main.inputMethod.hasPreedit()) {
+                throw new DBusError('com.mxshift.Waytool.Error.Composing',
+                    'an input method is composing text in the focused window');
+            }
+            Main.inputMethod.commit(text);
+            return true;
+        });
+    }
+
+    ForwardKeyAsync([keysym, keycode], invocation) {
+        this._serve(invocation, '(b)', () => {
+            if (Main.inputMethod.currentFocus === null)
+                return false;
+            // forward_key takes an XKB keycode: evdev + 8.
+            const time = global.display.get_current_time_roundtrip();
+            Main.inputMethod.forward_key(keysym, keycode + 8, 0, time, true);
+            Main.inputMethod.forward_key(keysym, keycode + 8, 0, time, false);
+            return true;
         });
     }
 }

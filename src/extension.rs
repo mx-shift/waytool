@@ -1,6 +1,6 @@
 //! Calls into the waytool gnome-shell extension's D-Bus interface
 //! (com.mxshift.Waytool): window information and focus control (see
-//! `windows`). If the
+//! `windows`), and typing text the keyboard layout lacks. If the
 //! extension isn't installed or enabled the calls fail at once, with an
 //! error saying so.
 
@@ -60,4 +60,25 @@ where
         zbus::Error::MethodError(_, Some(msg), _) => anyhow!("{method}: {msg}"),
         e => anyhow!("{EXT_INTERFACE}.{method} failed: {e}"),
     })
+}
+
+/// Whether the focused window takes text input, so `commit_text` can
+/// type into it.
+pub(crate) async fn can_commit_text(bus: &zbus::Connection) -> Result<bool> {
+    ext_call(&ext_proxy(bus).await?, "CanCommitText", &()).await
+}
+
+/// Type `text` into the focused window through gnome-shell's input
+/// method, as GNOME's on-screen keyboard does for emoji. Returns false,
+/// typing nothing, when the focused window doesn't take text input.
+pub(crate) async fn commit_text(bus: &zbus::Connection, text: &str) -> Result<bool> {
+    ext_call(&ext_proxy(bus).await?, "CommitText", &(text,)).await
+}
+
+/// Press and release a control key (evdev `keycode`, producing
+/// `keysym`) in the focused window through gnome-shell's input method,
+/// in order with `commit_text`. Returns false when the focused window
+/// doesn't take text input.
+pub(crate) async fn forward_key(bus: &zbus::Connection, keysym: u32, keycode: u32) -> Result<bool> {
+    ext_call(&ext_proxy(bus).await?, "ForwardKey", &(keysym, keycode)).await
 }

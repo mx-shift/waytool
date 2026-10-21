@@ -116,8 +116,11 @@ enum Cmd {
     /// A newline or tab types Return or Tab, and the modifiers each
     /// character's level needs are pressed with it; use `key-chord` for
     /// shortcuts. A character that isn't on the keyboard layout (an emoji,
-    /// say) can't be typed; a string with one is rejected before anything
-    /// is typed.
+    /// say) types too on GNOME, as text through the gnome-shell extension,
+    /// which reaches windows that take text input (GTK, Qt 6, Firefox) but
+    /// not X11 apps or emulators; there the whole string goes that way, to
+    /// keep its order. A string that can't be typed is rejected before
+    /// anything is typed.
     Type {
         /// The text to type.
         text: String,

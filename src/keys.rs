@@ -76,6 +76,19 @@ pub(crate) fn keysym_for_char(ch: char) -> Option<u32> {
     })
 }
 
+/// The evdev keycode of a control key's keysym (Return, Tab, BackSpace,
+/// Escape, Delete). These keys are at the same place on every layout.
+pub(crate) fn control_keycode(keysym: u32) -> Option<u32> {
+    Some(match keysym {
+        0xff0d => 28,  // KEY_ENTER
+        0xff09 => 15,  // KEY_TAB
+        0xff08 => 14,  // KEY_BACKSPACE
+        0xff1b => 1,   // KEY_ESC
+        0xffff => 111, // KEY_DELETE
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

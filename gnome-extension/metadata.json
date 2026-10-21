@@ -1,7 +1,7 @@
 {
     "uuid": "waytool@mxshift.com",
     "name": "waytool helper",
-    "description": "Lets the waytool daemon list and focus windows — data GNOME's own Introspect API restricts to an allowlist. Answers only the waytool daemon.",
+    "description": "Lets the waytool daemon list and focus windows — data GNOME's own Introspect API restricts to an allowlist — and type text the keyboard layout lacks, such as emoji. Answers only the waytool daemon.",
     "shell-version": ["45", "46", "47", "48", "49", "50"],
     "url": "https://github.com/mx-shift/waytool"
 }

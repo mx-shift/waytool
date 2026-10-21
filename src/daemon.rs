@@ -32,6 +32,7 @@ use futures_util::StreamExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, watch};
 
+use crate::extension::{can_commit_text, commit_text, forward_key};
 use crate::portal::Portal;
 use crate::protocol::{Error, Frame, StreamDesc, UiTree, WindowDict};
 use crate::windows::{Windows, dict_i64, summarize_windows, window_matches};
@@ -118,6 +119,12 @@ impl Daemon {
             *self.a11y.lock().await = None;
         }
         result
+    }
+
+    /// The session bus, for the GNOME extension, when it's this desktop's
+    /// window provider (and so there to commit text).
+    fn extension(&self) -> Option<&zbus::Connection> {
+        matches!(self.windows, Windows::Gnome(_)).then_some(&self.bus)
     }
 
     /// Fail while a re-establish is waiting on consent: the session in
@@ -554,6 +561,21 @@ impl Hangup {
     }
 }
 
+/// One character of a `type` request, and how it gets typed.
+enum Stroke {
+    /// A key on the layout, pressed on the keyboard device.
+    Key(u32),
+    /// A character committed as text through the gnome-shell extension.
+    Text(char),
+    /// A control key (keysym, evdev keycode) sent through the extension,
+    /// in order with commits.
+    Forward(u32, u32),
+}
+
+/// How long to wait for the focused window to accept text after
+/// focusing it, before giving up on characters that need it.
+const TEXT_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Type `text` into whatever currently holds keyboard focus, one
 /// press+release per character. `delay_ms` is how long to wait after
 /// each character — pacing for slow consumers (e.g. DOSBox's emulated
@@ -564,10 +586,24 @@ impl Hangup {
 /// that's down is always released first.
 ///
 /// A character that isn't on the keyboard layout can't be sent as a key
-/// press at all, so it's refused. Everything is checked before the
-/// first keystroke, so a string that can't be typed types nothing.
+/// press at all. Those are committed as text through the gnome-shell
+/// extension, the way GNOME's on-screen keyboard types emoji; that
+/// reaches windows that take text input (text-input-v3: GTK, Qt 6,
+/// Firefox) but not X11 apps, emulators or Chromium without its Wayland
+/// IME flag. Everything is checked before the first keystroke, so a
+/// string that can't be typed types nothing.
+///
+/// Key presses from the keyboard device and commits don't arrive in the
+/// order they're sent: gnome-shell hands each key press to the input
+/// method's engine (IBus) and delivers it when the engine answers, while
+/// a commit is queued at once. So a string that needs a commit goes
+/// entirely through the extension — printable characters committed,
+/// control characters (Return, Tab, ...) forwarded as keys — which keeps
+/// one queue and one order. Keys still waiting on the engine from an
+/// earlier request can still land after it.
 async fn type_text(
     portal: &Portal,
+    extension: Option<&zbus::Connection>,
     text: &str,
     delay_ms: u32,
     hold_ms: u32,
@@ -578,24 +614,75 @@ async fn type_text(
             return Err(anyhow!("--{name} is at most {MAX_PACING_MS} ms, got {ms}"));
         }
     }
+    let mut keyless = None;
     let mut syms = Vec::new();
     for ch in text.chars() {
         let sym = crate::keys::keysym_for_char(ch)
             .ok_or_else(|| anyhow!("can't type {ch:?}: it has no keysym (nothing was typed)"))?;
-        if !portal.has_keysym(sym)? {
-            return Err(anyhow!(
-                "{ch:?} isn't on the keyboard layout, so it can't be typed (nothing was typed)"
-            ));
+        if keyless.is_none() && !portal.has_keysym(sym)? {
+            keyless = Some(ch);
         }
-        syms.push(sym);
+        syms.push((ch, sym));
     }
-    for sym in syms {
+    let strokes: Vec<Stroke> = match keyless {
+        None => syms.into_iter().map(|(_, sym)| Stroke::Key(sym)).collect(),
+        Some(_) => syms
+            .into_iter()
+            .map(|(ch, sym)| {
+                if !ch.is_control() {
+                    return Ok(Stroke::Text(ch));
+                }
+                let code = crate::keys::control_keycode(sym).ok_or_else(|| {
+                    anyhow!("can't type {ch:?} alongside text (nothing was typed)")
+                })?;
+                Ok(Stroke::Forward(sym, code))
+            })
+            .collect::<Result<_>>()?,
+    };
+    if let Some(ch) = keyless {
+        // Only the GNOME extension can commit text.
+        let Some(bus) = extension else {
+            return Err(anyhow!(
+                "{ch:?} isn't on the keyboard layout, and this desktop offers no way to type \
+                 it as text — nothing was typed"
+            ));
+        };
+        let deadline = tokio::time::Instant::now() + TEXT_FOCUS_TIMEOUT;
+        while !can_commit_text(bus).await.with_context(|| {
+            format!("{ch:?} isn't on the keyboard layout, so it's typed as text")
+        })? {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "{ch:?} isn't on the keyboard layout, and the focused window doesn't \
+                     accept text input, so it can't be typed (nothing was typed)"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    for stroke in strokes {
         if hangup.happened() {
             return Err(anyhow!("client hung up; stopped typing"));
         }
-        portal.keysym(sym, true)?;
-        hangup.sleep(hold_ms).await;
-        portal.keysym(sym, false)?;
+        let accepted = match stroke {
+            Stroke::Key(sym) => {
+                portal.keysym(sym, true)?;
+                hangup.sleep(hold_ms).await;
+                portal.keysym(sym, false)?;
+                true
+            }
+            // Text and Forward strokes are only made when the extension is
+            // there (checked above).
+            Stroke::Text(ch) => commit_text(extension.expect("checked"), &ch.to_string()).await?,
+            Stroke::Forward(sym, code) => {
+                forward_key(extension.expect("checked"), sym, code).await?
+            }
+        };
+        if !accepted {
+            return Err(anyhow!(
+                "the focused window stopped accepting text input partway through"
+            ));
+        }
         hangup.sleep(delay_ms).await;
     }
     Ok(())
@@ -724,7 +811,15 @@ impl Service {
         let _call = self.admit()?;
         let (_input, portal) = self.daemon.input().await?;
         let hangup = self.hangup.clone();
-        type_text(&portal, &text, delay_ms, hold_ms, hangup).await?;
+        type_text(
+            &portal,
+            self.daemon.extension(),
+            &text,
+            delay_ms,
+            hold_ms,
+            hangup,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1003,7 +1098,15 @@ impl Service {
         let win = self.daemon.windows.resolve_and_focus(&window).await?;
         let id = dict_i64(&win, "id")?;
         let hangup = self.hangup.clone();
-        type_text(&portal, &text, delay_ms, hold_ms, hangup).await?;
+        type_text(
+            &portal,
+            self.daemon.extension(),
+            &text,
+            delay_ms,
+            hold_ms,
+            hangup,
+        )
+        .await?;
         Ok(id as u64)
     }
 
