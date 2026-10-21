@@ -1,7 +1,7 @@
 //! Where input and screenshots go: the RemoteDesktop and ScreenCast
 //! portals with libei (`portal`), where the desktop offers them (GNOME,
-//! KDE Plasma, COSMIC), or Wayland protocols (`wlr_input`; input only,
-//! so far) where it doesn't (sway and other wlroots compositors,
+//! KDE Plasma, COSMIC), or Wayland protocols (`wlr_input`,
+//! `wlr_capture`) where it doesn't (sway and other wlroots compositors,
 //! Hyprland, niri). The daemon picks one at start.
 //!
 //! The portal asks the user for consent and limits capture to the
@@ -100,7 +100,10 @@ pub(crate) async fn choose(bus: &zbus::Connection, wayland: &Wayland) -> Result<
 /// Whether the compositor offers everything the Wayland backend needs.
 fn native_complete(wayland: &Wayland) -> bool {
     let g = wayland.globals();
-    g.seat.is_some() && g.virtual_keyboard.is_some() && g.virtual_pointer.is_some()
+    g.seat.is_some()
+        && g.virtual_keyboard.is_some()
+        && g.virtual_pointer.is_some()
+        && (g.image_copy.is_some() && g.output_source.is_some() || g.screencopy.is_some())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,6 +131,13 @@ async fn remote_desktop_version(bus: &zbus::Connection) -> Result<u32> {
 
 impl Native {
     pub(crate) fn start(wayland: Arc<Wayland>) -> Result<Native> {
+        let g = wayland.globals();
+        if g.image_copy.is_none() && g.screencopy.is_none() {
+            return Err(anyhow!(
+                "the compositor offers no screen capture protocol \
+                 (ext-image-copy-capture-v1 or wlr-screencopy-unstable-v1)"
+            ));
+        }
         let input = WlrInput::new(wayland.clone())?;
         Ok(Native { wayland, input })
     }
@@ -234,9 +244,15 @@ impl Backend {
                 .await
                 .context("screenshot blocking task")?
             }
-            Backend::Native(_) => Err(anyhow!(
-                "the Wayland backend can't take screenshots yet; only the portals can"
-            )),
+            Backend::Native(n) => {
+                let mut frames = Vec::new();
+                for (monitor, output) in n.wayland.outputs() {
+                    frames.push(
+                        crate::wlr_capture::capture_output(&n.wayland, &monitor, &output).await?,
+                    );
+                }
+                Ok(frames)
+            }
         }
     }
 

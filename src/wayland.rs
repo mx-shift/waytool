@@ -5,9 +5,9 @@
 //! xdg-output (its rect in the compositor's logical layout), which
 //! every desktop compositor implements, so `monitors` and display-change
 //! tracking work the same everywhere. The keyboard layout is the keymap
-//! the compositor sends a client's wl_keyboard. The virtual input
-//! managers are what the Wayland backend (`wlr_input`) uses where
-//! there's no RemoteDesktop portal.
+//! the compositor sends a client's wl_keyboard. The input and capture
+//! managers are what the Wayland backend (`wlr_input`, `wlr_capture`)
+//! uses where there's no RemoteDesktop portal.
 //!
 //! Events are read on a thread of its own; requests can be made from any
 //! thread through the proxies here (wayland-client is thread-safe), and
@@ -17,10 +17,13 @@ use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
-use wayland_client::protocol::{wl_keyboard, wl_output, wl_registry, wl_seat};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_registry, wl_seat, wl_shm};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 
 /// One output (monitor), as the compositor lays it out.
@@ -39,6 +42,8 @@ pub(crate) struct Monitor {
     /// displayed, after rotation) over the logical size. A screenshot of
     /// the monitor is its logical size times this.
     pub scale: f64,
+    /// How the output turns its framebuffer for display.
+    pub transform: wl_output::Transform,
 }
 
 /// The globals the Wayland backend can use, where the compositor offers
@@ -46,8 +51,12 @@ pub(crate) struct Monitor {
 #[derive(Clone, Default)]
 pub(crate) struct Globals {
     pub seat: Option<wl_seat::WlSeat>,
+    pub shm: Option<wl_shm::WlShm>,
     pub virtual_keyboard: Option<ZwpVirtualKeyboardManagerV1>,
     pub virtual_pointer: Option<ZwlrVirtualPointerManagerV1>,
+    pub image_copy: Option<ExtImageCopyCaptureManagerV1>,
+    pub output_source: Option<ExtOutputImageCaptureSourceManagerV1>,
+    pub screencopy: Option<ZwlrScreencopyManagerV1>,
 }
 
 /// What the event thread keeps current for the rest of the daemon.
@@ -131,6 +140,11 @@ impl Wayland {
     pub(crate) fn monitors(&self) -> Vec<Monitor> {
         let shared = self.shared.lock().unwrap();
         shared.monitors.iter().map(|(m, _)| m.clone()).collect()
+    }
+
+    /// The monitors with their wl_outputs.
+    pub(crate) fn outputs(&self) -> Vec<(Monitor, wl_output::WlOutput)> {
+        self.shared.lock().unwrap().monitors.clone()
     }
 
     /// A receiver that changes whenever the layout does, or the
@@ -249,6 +263,7 @@ impl State {
                     width,
                     height,
                     scale,
+                    transform: o.transform.unwrap_or(wl_output::Transform::Normal),
                 };
                 Some((monitor, o.wl.clone()?))
             })
@@ -330,11 +345,21 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     "wl_seat" if g.seat.is_none() => {
                         g.seat = Some(registry.bind(name, version.min(5), qh, ()));
                     }
+                    "wl_shm" => g.shm = Some(registry.bind(name, 1, qh, ())),
                     "zwp_virtual_keyboard_manager_v1" => {
                         g.virtual_keyboard = Some(registry.bind(name, 1, qh, ()))
                     }
                     "zwlr_virtual_pointer_manager_v1" => {
                         g.virtual_pointer = Some(registry.bind(name, version.min(2), qh, ()))
+                    }
+                    "ext_image_copy_capture_manager_v1" => {
+                        g.image_copy = Some(registry.bind(name, 1, qh, ()))
+                    }
+                    "ext_output_image_capture_source_manager_v1" => {
+                        g.output_source = Some(registry.bind(name, 1, qh, ()))
+                    }
+                    "zwlr_screencopy_manager_v1" => {
+                        g.screencopy = Some(registry.bind(name, version.min(3), qh, ()))
                     }
                     _ => {}
                 }
@@ -492,8 +517,12 @@ macro_rules! no_events {
 
 no_events!(
     zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    wl_shm::WlShm,
     ZwpVirtualKeyboardManagerV1,
     ZwlrVirtualPointerManagerV1,
+    ExtImageCopyCaptureManagerV1,
+    ExtOutputImageCaptureSourceManagerV1,
+    ZwlrScreencopyManagerV1,
 );
 
 #[cfg(test)]

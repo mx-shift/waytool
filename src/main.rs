@@ -1,7 +1,7 @@
 //! waytool: command-line keyboard and pointer input, screenshots
 //! and window control on Wayland: through the freedesktop RemoteDesktop
 //! and ScreenCast portals where the desktop offers them, else Wayland's
-//! virtual input protocols (see `backend`), with window
+//! virtual input and capture protocols (see `backend`), with window
 //! information from each desktop's own source (see `windows`).
 //!
 //! Architecture: one persistent daemon owns the session; every other
@@ -30,6 +30,7 @@ mod portal;
 mod protocol;
 mod wayland;
 mod windows;
+mod wlr_capture;
 mod wlr_input;
 
 use anyhow::{Context, Result, anyhow};
@@ -43,8 +44,8 @@ use clap::{Parser, Subcommand};
                   Input and screenshots go through the RemoteDesktop and ScreenCast portals \
                   where the desktop offers them with libei (GNOME 45+, KDE Plasma 6.1+, COSMIC), \
                   asking for screen-sharing consent when the daemon starts; elsewhere (sway and \
-                  other wlroots compositors, Hyprland, niri) through Wayland's virtual input \
-                  protocols, which ask nothing (no screenshots there yet).\n\
+                  other wlroots compositors, Hyprland, niri) through Wayland's virtual input and \
+                  screen capture protocols, which ask nothing.\n\
                   \n\
                   [windows]  Needs the desktop's window information: on GNOME, the waytool \
                   gnome-shell extension. Without it these commands fail with an error saying \

@@ -3,7 +3,7 @@
 //! Architecture:
 //! - `waytool daemon` sets up input and capture (a RemoteDesktop
 //!   and ScreenCast portal session with libei input, or Wayland's
-//!   virtual input protocols; see `backend`), finds the
+//!   virtual input and capture protocols; see `backend`), finds the
 //!   desktop's window source (`windows`), then serves the D-Bus
 //!   interface in `protocol` peer-to-peer on a unix socket.
 //! - All other subcommands (`key`, `type`, `click`, `screenshot`, ...)
