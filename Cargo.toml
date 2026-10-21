@@ -3,7 +3,7 @@ name = "waytool"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Command-line automation for Wayland: keyboard and pointer input, screenshots and window control through the freedesktop portals"
+description = "Command-line automation for Wayland: keyboard and pointer input, screenshots and window control on GNOME, KDE, wlroots compositors, Hyprland and niri"
 license = "Apache-2.0"
 repository = "https://github.com/mx-shift/waytool"
 readme = "README.md"
@@ -51,8 +51,10 @@ suggests = "gnome-shell"
 extended-description = """\
 Synthetic keyboard and pointer input, per-monitor screenshots and window \
 control on a Wayland desktop, through the freedesktop RemoteDesktop and \
-ScreenCast portals. Includes a systemd user unit for the daemon and an \
-optional gnome-shell extension for windows and text input on GNOME."""
+ScreenCast portals or Wayland's virtual input and capture protocols. \
+Includes a systemd user unit for the daemon, a KWin script for windows \
+on KDE Plasma, and an optional gnome-shell extension for windows and \
+text input on GNOME."""
 assets = [
     ["target/release/waytool", "usr/bin/", "755"],
     ["target/release/waytool.service", "usr/lib/systemd/user/", "644"],
