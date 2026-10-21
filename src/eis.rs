@@ -534,6 +534,17 @@ impl Eis {
         })?;
         Some(Region::from(found))
     }
+
+    /// Whether global logical point (x, y) is inside some region.
+    pub(crate) fn in_any_region(&self, x: f64, y: f64) -> bool {
+        let st = self.state.lock().unwrap();
+        st.absolute.as_ref().is_some_and(|s| {
+            s.device
+                .regions()
+                .iter()
+                .any(|r| Region::from(r).contains(x, y))
+        })
+    }
 }
 
 fn check_code(code: u32) -> Result<()> {

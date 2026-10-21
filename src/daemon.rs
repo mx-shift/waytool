@@ -439,6 +439,16 @@ impl Service {
         Ok(())
     }
 
+    /// Absolute move to global logical coordinates, the space the portal
+    /// reports stream positions in.
+    async fn move_global(&self, x: f64, y: f64) -> Result<(), Error> {
+        let _call = self.admit()?;
+        finite(&[x, y])?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.move_to_global(x, y)?;
+        Ok(())
+    }
+
     /// Relative pointer motion, dx/dy in logical pixels. Absolute moves
     /// do nothing once an app holds a pointer lock (86Box with the guest
     /// mouse captured, games): the compositor pins the pointer and hands
@@ -482,6 +492,17 @@ impl Service {
         let code = crate::keys::button_code(&button)?;
         let (_input, portal) = self.daemon.input().await?;
         portal.move_to_pixel(stream, x, y)?;
+        portal.click(code)?;
+        Ok(())
+    }
+
+    /// Move (global logical coords) + click.
+    async fn click_global(&self, x: f64, y: f64, button: String) -> Result<(), Error> {
+        let _call = self.admit()?;
+        finite(&[x, y])?;
+        let code = crate::keys::button_code(&button)?;
+        let (_input, portal) = self.daemon.input().await?;
+        portal.move_to_global(x, y)?;
         portal.click(code)?;
         Ok(())
     }

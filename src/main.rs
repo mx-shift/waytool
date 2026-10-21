@@ -138,13 +138,23 @@ enum Cmd {
         stream: u32,
     },
 
+    /// Move the pointer to a global logical coordinate.
+    ///
+    /// The compositor's layout: the space `streams` reports positions in.
+    MoveGlobal {
+        /// Global logical x.
+        x: f64,
+        /// Global logical y.
+        y: f64,
+    },
+
     /// Move the pointer by a relative delta, for apps that lock the pointer.
     ///
     /// DX and DY are in logical pixels. When the focused app holds a
     /// pointer lock (86Box with the guest mouse captured, MartyPC, games)
     /// the compositor pins the pointer and passes the app relative motion,
-    /// so `move` does nothing there. Guest mice are relative too, so steer
-    /// by deltas and check with a `screenshot`.
+    /// so `move` and `move-global` do nothing there. Guest mice are
+    /// relative too, so steer by deltas and check with a `screenshot`.
     MoveRel {
         /// Horizontal delta.
         dx: f64,
@@ -190,6 +200,19 @@ enum Cmd {
         /// Stream index, from `streams`.
         #[arg(long, default_value_t = 0)]
         stream: u32,
+    },
+
+    /// Move to a global logical coordinate and click.
+    ///
+    /// Coordinates as for `move-global`.
+    ClickGlobal {
+        /// Global logical x.
+        x: f64,
+        /// Global logical y.
+        y: f64,
+        /// left, right, middle, back or forward.
+        #[arg(long, default_value = "left")]
+        button: String,
     },
 
     /* ----- capture ----- */
@@ -250,6 +273,7 @@ async fn call(cmd: Cmd) -> Result<()> {
             .await
             .map_err(protocol::describe)?,
         Cmd::Move { x, y, stream } => d.move_to(x, y, stream).await.map_err(protocol::describe)?,
+        Cmd::MoveGlobal { x, y } => d.move_global(x, y).await.map_err(protocol::describe)?,
         Cmd::MoveRel { dx, dy } => d.move_rel(dx, dy).await.map_err(protocol::describe)?,
         Cmd::Click { button } => d.click(&button).await.map_err(protocol::describe)?,
         Cmd::ButtonDown { button } => d.button_down(&button).await.map_err(protocol::describe)?,
@@ -261,6 +285,10 @@ async fn call(cmd: Cmd) -> Result<()> {
             stream,
         } => d
             .click_at(x, y, &button, stream)
+            .await
+            .map_err(protocol::describe)?,
+        Cmd::ClickGlobal { x, y, button } => d
+            .click_global(x, y, &button)
             .await
             .map_err(protocol::describe)?,
         Cmd::Screenshot { out } => {

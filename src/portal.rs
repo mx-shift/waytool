@@ -159,6 +159,15 @@ impl Portal {
         let (gx, gy) = region.pixel_to_global(x, y);
         self.eis.move_abs(gx, gy)
     }
+
+    /// Move the pointer to a global logical coordinate — the space
+    /// window and monitor rects are reported in.
+    pub(crate) fn move_to_global(&self, x: f64, y: f64) -> Result<()> {
+        if !self.eis.in_any_region(x, y) {
+            return Err(anyhow!("no monitor covers global point ({x}, {y})"));
+        }
+        self.eis.move_abs(x, y)
+    }
 }
 
 /// Connect the session's input through libei.

@@ -110,6 +110,8 @@ pub trait Daemon {
     /// `stream`.
     #[zbus(name = "Move")]
     fn move_to(&self, x: f64, y: f64, stream: u32) -> Result<(), Error>;
+    /// Move the pointer to a global logical coordinate.
+    fn move_global(&self, x: f64, y: f64) -> Result<(), Error>;
     /// Move the pointer by a relative delta in logical pixels.
     fn move_rel(&self, dx: f64, dy: f64) -> Result<(), Error>;
     /// Press+release a pointer button (left, right, middle, back,
@@ -122,6 +124,8 @@ pub trait Daemon {
     /// Move to screenshot pixels (x, y) of stream index `stream`, then
     /// click.
     fn click_at(&self, x: f64, y: f64, button: &str, stream: u32) -> Result<(), Error>;
+    /// Move to a global logical coordinate, then click.
+    fn click_global(&self, x: f64, y: f64, button: &str) -> Result<(), Error>;
 
     /// The portal streams, in index order.
     fn streams(&self) -> Result<Vec<StreamDesc>, Error>;
