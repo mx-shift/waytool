@@ -17,9 +17,27 @@ pixels, so a script can click on what it sees, scaled monitors included.
 "portal" is the RemoteDesktop and ScreenCast portals: the daemon asks for consent when it
 starts, and you select every monitor to capture or click on.
 
-## Build
+## Install
 
-With Rust 1.88 or later:
+Each [release](https://github.com/mx-shift/waytool/releases) has, for x86-64 and aarch64:
+
+| For | File |
+|---|---|
+| Fedora | `waytool-<version>-1.fc44.<arch>.rpm` |
+| Ubuntu 24.04 and newer | `waytool_<version>-1_<arch>.deb` |
+| Other Linux (glibc 2.34 or newer) | `waytool-<version>-<arch>-linux.tar.gz`; needs `libpipewire-0.3` and `libxkbcommon` |
+
+The packages install `waytool`, a systemd user unit for the daemon, and the GNOME extension
+(not enabled). The tarball has the binary, without the unit or the extension.
+
+To check a download (GitHub CLI):
+
+```
+sha256sum -c --ignore-missing SHA256SUMS
+gh attestation verify <file> --repo mx-shift/waytool
+```
+
+Or build from source, with Rust 1.88 or later:
 
 ```
 sudo dnf install pipewire-devel libxkbcommon-devel clang      # Fedora
@@ -30,9 +48,12 @@ cargo build --release
 ### GNOME
 
 GNOME needs the extension for windows and for text the layout lacks; it also adds a Waytool
-toggle to Quick Settings. Run `gnome-extension/install.sh`, then log out and back in:
-gnome-shell picks up a new extension only at login. It also installs a systemd user unit for
-the daemon, pointing at the checkout's release binary, which the toggle starts and stops.
+toggle to Quick Settings, which starts and stops the daemon's systemd user unit. gnome-shell
+picks up a new extension only at login.
+
+- From a package: log out and back in, then `gnome-extensions enable waytool@mxshift.com`.
+- From a source checkout: `gnome-extension/install.sh`, then log out and back in. It also
+  installs the systemd unit, pointing at the checkout's release binary.
 
 ## Quick start
 
@@ -48,6 +69,9 @@ waytool ui-find calculator 7 --role button
 
 `waytool --help` lists the commands and `--help` on one gives the details. Commands marked
 [windows] need the GNOME extension.
+
+With a package installed, the daemon can also run as a systemd user unit (`systemctl --user
+start waytool`).
 
 ## Notes
 
