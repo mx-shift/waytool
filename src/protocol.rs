@@ -77,6 +77,33 @@ pub struct Frame {
     pub rgba: zvariant::OwnedFd,
 }
 
+/// Elements of a window's accessibility (AT-SPI2) tree.
+#[derive(Debug, Serialize, Deserialize, Type)]
+pub struct UiTree {
+    pub window_id: u64,
+    /// Rects are relative to the window's frame, so they feed straight
+    /// into ClickIn. When false they are relative to the app's a11y
+    /// toplevel, whose screen position couldn't be verified (typical
+    /// for Wayland-native apps).
+    pub frame_relative: bool,
+    /// The walk hit its element budget before visiting everything.
+    pub truncated: bool,
+    pub nodes: Vec<UiNode>,
+}
+
+/// One accessibility element. `rect` is (x, y, w, h); it is absent for
+/// elements without extents and for hidden ones, whose reported
+/// positions are meaningless.
+#[derive(Debug, SerializeDict, DeserializeDict, Type)]
+#[zvariant(signature = "dict")]
+pub struct UiNode {
+    pub depth: u32,
+    pub role: String,
+    pub name: String,
+    pub showing: bool,
+    pub rect: Option<(i32, i32, i32, i32)>,
+}
+
 /// A window or monitor as the gnome-shell extension describes it,
 /// passed through unchanged: `a{sv}` with keys like `id`, `title`,
 /// `frame_x`, `scale`.
@@ -190,6 +217,12 @@ pub trait Daemon {
     /// Focus a window, then type into it like TypeText. Returns the
     /// window id.
     fn type_in(&self, window: &str, text: &str, delay_ms: u32, hold_ms: u32) -> Result<u64, Error>;
+    /// A window's accessibility tree down to `depth` levels; hidden
+    /// elements only when `all` is set.
+    fn ui_tree(&self, window: &str, depth: u32, all: bool) -> Result<UiTree, Error>;
+    /// Accessibility elements whose name contains `pattern`, optionally
+    /// restricted to `role` (empty for any).
+    fn ui_find(&self, window: &str, pattern: &str, role: &str) -> Result<UiTree, Error>;
 }
 
 /// Connect to the running daemon.

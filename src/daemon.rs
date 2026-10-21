@@ -33,7 +33,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::portal::Portal;
-use crate::protocol::{Error, Frame, StreamDesc, WindowDict};
+use crate::protocol::{Error, Frame, StreamDesc, UiTree, WindowDict};
 use crate::windows::{Windows, dict_i64, summarize_windows, window_matches};
 
 /// Tell systemd about our state when run as a `Type=notify` unit
@@ -86,11 +86,38 @@ pub(crate) struct Daemon {
     windows: Windows,
     /// The monitor layout, from the daemon's own Wayland connection.
     outputs: Arc<crate::wayland::Wayland>,
+    /// The accessibility bus, connected on first use and again after a
+    /// failed query (see `with_a11y`).
+    a11y: Mutex<Option<zbus::Connection>>,
 }
 
 impl Daemon {
     fn portal(&self) -> Arc<Portal> {
         self.portal.lock().unwrap().clone()
+    }
+
+    async fn a11y(&self) -> Result<zbus::Connection> {
+        let mut a11y = self.a11y.lock().await;
+        if let Some(conn) = &*a11y {
+            return Ok(conn.clone());
+        }
+        let conn = crate::atspi::a11y_connection(&self.bus).await?;
+        *a11y = Some(conn.clone());
+        Ok(conn)
+    }
+
+    /// Run `query` against the accessibility bus. After a failure the
+    /// connection is dropped, so the next query connects afresh in case
+    /// the accessibility bus went away and came back.
+    async fn with_a11y<T, F>(&self, query: impl FnOnce(zbus::Connection) -> F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let result = query(self.a11y().await?).await;
+        if result.is_err() {
+            *self.a11y.lock().await = None;
+        }
+        result
     }
 
     /// Fail while a re-establish is waiting on consent: the session in
@@ -430,6 +457,7 @@ pub async fn run_daemon() -> Result<()> {
         windows,
         bus,
         outputs,
+        a11y: Mutex::new(None),
     });
 
     // Exit the daemon if the portal session ends out from under us;
@@ -977,6 +1005,35 @@ impl Service {
         let hangup = self.hangup.clone();
         type_text(&portal, &text, delay_ms, hold_ms, hangup).await?;
         Ok(id as u64)
+    }
+
+    /// A window's AT-SPI accessibility tree, depth-first, down to
+    /// `depth` levels. Elements not currently SHOWING (popped-down
+    /// menus etc.) are left out unless `all` is set.
+    async fn ui_tree(&self, window: String, depth: u32, all: bool) -> Result<UiTree, Error> {
+        let _call = self.admit()?;
+        let d = &self.daemon;
+        Ok(d.with_a11y(|a11y| async move {
+            crate::atspi::ui_tree(&d.windows, &a11y, &window, depth, all).await
+        })
+        .await?)
+    }
+
+    /// Elements of a window's accessibility tree whose name contains
+    /// `pattern` (case-insensitive; empty matches everything), hidden
+    /// ones included, optionally restricted to `role` (empty for any).
+    async fn ui_find(
+        &self,
+        window: String,
+        pattern: String,
+        role: String,
+    ) -> Result<UiTree, Error> {
+        let _call = self.admit()?;
+        let d = &self.daemon;
+        Ok(d.with_a11y(|a11y| async move {
+            crate::atspi::ui_find(&d.windows, &a11y, &window, &pattern, &role).await
+        })
+        .await?)
     }
 }
 

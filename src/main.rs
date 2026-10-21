@@ -15,6 +15,7 @@
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
+mod atspi;
 mod capture;
 mod daemon;
 mod display;
@@ -344,6 +345,44 @@ enum Cmd {
         #[arg(long)]
         hold: Option<u32>,
     },
+
+    /* ----- accessibility (AT-SPI2) introspection ----- */
+    /// [windows] Print a window's accessibility (AT-SPI2) tree.
+    ///
+    /// One line per element, indented by depth: role, name and rect, so you
+    /// can target buttons, menus and fields by name rather than by pixels.
+    /// Only apps that expose accessibility info have a tree (GTK, Qt,
+    /// Firefox, Chromium; not SDL apps or emulators). When the app's screen
+    /// position can be checked (X11 and XWayland apps), rects are relative
+    /// to the window's frame and feed straight into `click-in`.
+    UiTree {
+        /// Window id, or a pattern matching one window's wm_class, app_id
+        /// or title.
+        window: String,
+        /// How many levels to descend.
+        #[arg(long, default_value_t = 40)]
+        depth: u32,
+        /// Include elements that aren't showing (closed menus, hidden
+        /// panes).
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// [windows] Find elements in a window's accessibility tree by name.
+    ///
+    /// Matches names containing PATTERN, ignoring case, hidden elements
+    /// included, and prints each with a center point for `click-in`.
+    UiFind {
+        /// Window id, or a pattern matching one window's wm_class, app_id
+        /// or title.
+        window: String,
+        /// Text to look for in element names.
+        pattern: String,
+        /// Role name to require, ignoring case, e.g. "push button" or "menu
+        /// item".
+        #[arg(long)]
+        role: Option<String>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -473,9 +512,74 @@ async fn call(cmd: Cmd) -> Result<()> {
             let nchars = text.chars().count();
             println!("typed {nchars} character(s) into window {id}");
         }
+        Cmd::UiTree { window, depth, all } => {
+            let tree = d
+                .ui_tree(&window, depth, all)
+                .await
+                .map_err(protocol::describe)?;
+            println!("{}", ui_coord_header(&tree));
+            for n in &tree.nodes {
+                let mut line = format!("{}{}", "  ".repeat(n.depth as usize), n.role);
+                if !n.name.is_empty() {
+                    line.push_str(&format!(" {:?}", n.name));
+                }
+                if !n.showing {
+                    line.push_str(" [hidden]");
+                } else if let Some((x, y, w, h)) = n.rect {
+                    line.push_str(&format!(" ({x},{y} {w}x{h})"));
+                }
+                println!("{line}");
+            }
+            if tree.truncated {
+                println!("... truncated at the element budget — use --depth or ui-find");
+            }
+        }
+        Cmd::UiFind {
+            window,
+            pattern,
+            role,
+        } => {
+            let hits = d
+                .ui_find(&window, &pattern, role.as_deref().unwrap_or(""))
+                .await
+                .map_err(protocol::describe)?;
+            println!("{}", ui_coord_header(&hits));
+            for n in &hits.nodes {
+                let mut line = format!("{} {:?}", n.role, n.name);
+                if !n.showing {
+                    line.push_str(" [hidden — open its menu/pane first, then re-run]");
+                } else if let Some((x, y, w, h)) = n.rect {
+                    line.push_str(&format!(
+                        " center=({},{}) rect=({x},{y} {w}x{h})",
+                        x + w / 2,
+                        y + h / 2
+                    ));
+                }
+                println!("{line}");
+            }
+            if hits.truncated {
+                println!("... walk truncated — matches beyond the budget were not seen");
+            }
+        }
         Cmd::Daemon => unreachable!("the daemon is not a client command"),
     }
     Ok(())
+}
+
+/// Header line telling the caller what space ui-tree/ui-find
+/// coordinates are in, and how to click them.
+fn ui_coord_header(tree: &protocol::UiTree) -> String {
+    let id = tree.window_id;
+    if tree.frame_relative {
+        format!("coords are relative to window {id}'s frame — click with `click-in {id} <x> <y>`")
+    } else {
+        format!(
+            "coords are relative to the app's a11y toplevel (its screen \
+             position is unverifiable — typical for Wayland-native apps); \
+             for CSD apps this usually equals window {id}'s frame space \
+             (`click-in {id} <x> <y>`) — verify against a screenshot"
+        )
+    }
 }
 
 /// Print extension dicts as `key<TAB>value` lines, sorted by key, under
