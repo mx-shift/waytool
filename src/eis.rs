@@ -21,7 +21,7 @@
 //! `daemon::type_text` for how those are typed.
 
 use std::collections::HashSet;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -36,6 +36,48 @@ use crate::keymap::{Events, Keys, Layout, canonical, check_code};
 /// How long to wait after connecting for the compositor to offer and
 /// resume the devices.
 const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a flush waits for the compositor to make room on the socket.
+const FLUSH_TIMEOUT_MS: i32 = 5000;
+
+/// Send the requests buffered on `connection`. The socket is
+/// non-blocking, so when events are sent faster than the compositor reads
+/// them (a long string typed at full speed) the kernel's buffer fills and
+/// the send fails with EAGAIN. reis keeps what it couldn't send, so wait
+/// until the socket takes more and send the rest.
+fn flush(connection: &reis::event::Connection, socket: &UnixStream) -> Result<()> {
+    loop {
+        let errno = match connection.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) => e.raw_os_error(),
+        };
+        if errno == libc::EINTR {
+            continue;
+        }
+        if errno != libc::EAGAIN {
+            return Err(std::io::Error::from_raw_os_error(errno)).context("libei flush");
+        }
+        let mut fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one pollfd for a socket this function borrows.
+        let ready = unsafe { libc::poll(&mut fd, 1, FLUSH_TIMEOUT_MS) };
+        if ready == 0 {
+            return Err(anyhow!(
+                "libei flush: the compositor took no input events for {}s",
+                FLUSH_TIMEOUT_MS / 1000
+            ));
+        }
+        if ready < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e).context("libei flush: poll");
+            }
+        }
+    }
+}
 
 /// One device the compositor offered.
 struct Slot {
@@ -287,8 +329,7 @@ impl Eis {
             device.stop_emulating(serial);
             slot.emulating = false;
         }
-        self.connection.flush().context("libei flush")?;
-        Ok(())
+        flush(&self.connection, &self.socket)
     }
 
     /// Whether `keysym` is on the current keyboard layout. An error if
@@ -511,6 +552,14 @@ fn run_events(
     connected: tokio::sync::oneshot::Sender<Result<reis::event::Connection>>,
     ready: tokio::sync::oneshot::Sender<()>,
 ) {
+    // To wait on when a flush finds the socket full (see `flush`).
+    let poll_socket = match socket.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = connected.send(Err(anyhow!(e).context("duplicate the libei socket")));
+            return;
+        }
+    };
     let handshake = ei::Context::new(socket)
         .context("libei socket")
         .and_then(|context| {
@@ -525,7 +574,7 @@ fn run_events(
             return;
         }
     };
-    let _ = connection.flush();
+    let _ = flush(&connection, &poll_socket);
     let _ = connected.send(Ok(connection.clone()));
 
     let mut ready = Some(ready);
@@ -537,8 +586,8 @@ fn run_events(
         }
         // Handling an event can queue requests (binding the seat's
         // capabilities); they reach the compositor only once flushed.
-        if let Err(e) = connection.flush() {
-            st.disconnected = Some(format!("libei flush: {e}"));
+        if let Err(e) = flush(&connection, &poll_socket) {
+            st.disconnected = Some(format!("{e:#}"));
         }
         if (st.ready() || st.disconnected.is_some())
             && let Some(tx) = ready.take()
