@@ -2,7 +2,7 @@
 name = "waytool"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Command-line automation for Wayland: keyboard and pointer input, screenshots and window control on GNOME, KDE, wlroots compositors, Hyprland and niri"
 license = "Apache-2.0"
 repository = "https://github.com/mx-shift/waytool"
@@ -31,8 +31,7 @@ wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "st
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 xkbcommon = { version = "0.9.0", default-features = false }
-zbus = { version = "5.15.0", default-features = false, features = ["tokio", "p2p"] }
-zvariant = "5"
+zbus = { version = "6.0.0", default-features = false, features = ["tokio", "p2p", "proxy", "service"] }
 
 [profile.release]
 strip = true

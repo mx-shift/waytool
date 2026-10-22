@@ -44,7 +44,7 @@ sha256sum -c --ignore-missing SHA256SUMS
 gh attestation verify <file> --repo mx-shift/waytool
 ```
 
-Or build from source, with Rust 1.88 or later:
+Or build from source, with Rust 1.89 or later:
 
 ```
 sudo dnf install pipewire-devel libxkbcommon-devel clang      # Fedora

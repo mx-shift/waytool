@@ -97,7 +97,7 @@ impl Kwin {
             )
             .await
             .context("serve the KWin script's object")?;
-        bus.request_name_with_flags(NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())
+        bus.request_name_with_flags(NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
             .await
             .with_context(|| format!("own {NAME} (is another waytool daemon running?)"))?;
         Ok(Kwin {

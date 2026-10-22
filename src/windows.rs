@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use zvariant::{OwnedValue, Value};
+use zbus::{OwnedVariant, Variant};
 
 use crate::extension::{ext_call, ext_proxy};
 use crate::protocol::{WindowDict, render_value};
@@ -256,10 +256,10 @@ impl Windows {
 }
 
 /// A window dict from its fields.
-fn dict(entries: Vec<(&str, Value)>) -> Result<WindowDict> {
+fn dict(entries: Vec<(&str, Variant)>) -> Result<WindowDict> {
     entries
         .into_iter()
-        .map(|(k, v)| Ok((k.to_owned(), OwnedValue::try_from(v)?)))
+        .map(|(k, v)| Ok((k.to_owned(), OwnedVariant::try_from(v)?)))
         .collect()
 }
 
@@ -330,20 +330,20 @@ fn kwin_window(w: &serde_json::Value) -> Result<WindowDict> {
     let text = |k: &str| w[k].as_str().unwrap_or("").to_owned();
     let flag = |k: &str| w[k].as_bool().unwrap_or(false);
     dict(vec![
-        ("id", Value::U64(id)),
+        ("id", Variant::U64(id)),
         ("title", text("title").into()),
         ("app_id", text("app_id").into()),
         ("wm_class", text("wm_class").into()),
-        ("pid", Value::I32(int(&w["pid"]))),
+        ("pid", Variant::I32(int(&w["pid"]))),
         ("monitor", text("monitor").into()),
-        ("frame_x", Value::I32(int(&f[0]))),
-        ("frame_y", Value::I32(int(&f[1]))),
-        ("frame_w", Value::I32(int(&f[2]))),
-        ("frame_h", Value::I32(int(&f[3]))),
-        ("client_x", Value::I32(int(&c[0]))),
-        ("client_y", Value::I32(int(&c[1]))),
-        ("client_w", Value::I32(int(&c[2]))),
-        ("client_h", Value::I32(int(&c[3]))),
+        ("frame_x", Variant::I32(int(&f[0]))),
+        ("frame_y", Variant::I32(int(&f[1]))),
+        ("frame_w", Variant::I32(int(&f[2]))),
+        ("frame_h", Variant::I32(int(&f[3]))),
+        ("client_x", Variant::I32(int(&c[0]))),
+        ("client_y", Variant::I32(int(&c[1]))),
+        ("client_w", Variant::I32(int(&c[2]))),
+        ("client_h", Variant::I32(int(&c[3]))),
         ("focused", flag("focused").into()),
         ("minimized", flag("minimized").into()),
         ("maximized", flag("maximized").into()),
@@ -358,7 +358,7 @@ fn kwin_window(w: &serde_json::Value) -> Result<WindowDict> {
 
 fn toplevel_window(t: &crate::wayland::Toplevel) -> Result<WindowDict> {
     let mut fields = vec![
-        ("id", Value::U64(t.id)),
+        ("id", Variant::U64(t.id)),
         ("title", t.title.as_str().into()),
         ("app_id", t.app_id.as_str().into()),
         ("wm_class", t.app_id.as_str().into()),
@@ -372,14 +372,14 @@ fn toplevel_window(t: &crate::wayland::Toplevel) -> Result<WindowDict> {
     // with no frame of its own.
     if let Some((x, y, w, h)) = t.rect {
         fields.extend([
-            ("frame_x", Value::I32(x)),
-            ("frame_y", Value::I32(y)),
-            ("frame_w", Value::I32(w)),
-            ("frame_h", Value::I32(h)),
-            ("client_x", Value::I32(x)),
-            ("client_y", Value::I32(y)),
-            ("client_w", Value::I32(w)),
-            ("client_h", Value::I32(h)),
+            ("frame_x", Variant::I32(x)),
+            ("frame_y", Variant::I32(y)),
+            ("frame_w", Variant::I32(w)),
+            ("frame_h", Variant::I32(h)),
+            ("client_x", Variant::I32(x)),
+            ("client_y", Variant::I32(y)),
+            ("client_w", Variant::I32(w)),
+            ("client_h", Variant::I32(h)),
         ]);
     }
     dict(fields)
@@ -477,21 +477,21 @@ fn sway_window(
         .to_owned();
     let ws_name = workspace.and_then(|w| w["name"].as_str()).unwrap_or("");
     dict(vec![
-        ("id", Value::U64(n["id"].as_u64().unwrap_or(0))),
+        ("id", Variant::U64(n["id"].as_u64().unwrap_or(0))),
         ("title", n["name"].as_str().unwrap_or("").into()),
         ("app_id", app_id.clone().into()),
         ("wm_class", if is_x11 { class } else { app_id }.into()),
-        ("pid", Value::I32(num(&n["pid"]))),
+        ("pid", Variant::I32(num(&n["pid"]))),
         ("monitor", output.into()),
         ("is_x11", is_x11.into()),
-        ("frame_x", Value::I32(num(&rect["x"]))),
-        ("frame_y", Value::I32(num(&rect["y"]))),
-        ("frame_w", Value::I32(num(&rect["width"]))),
-        ("frame_h", Value::I32(num(&rect["height"]))),
-        ("client_x", Value::I32(num(&rect["x"]) + num(&inner["x"]))),
-        ("client_y", Value::I32(num(&rect["y"]) + num(&inner["y"]))),
-        ("client_w", Value::I32(num(&inner["width"]))),
-        ("client_h", Value::I32(num(&inner["height"]))),
+        ("frame_x", Variant::I32(num(&rect["x"]))),
+        ("frame_y", Variant::I32(num(&rect["y"]))),
+        ("frame_w", Variant::I32(num(&rect["width"]))),
+        ("frame_h", Variant::I32(num(&rect["height"]))),
+        ("client_x", Variant::I32(num(&rect["x"]) + num(&inner["x"]))),
+        ("client_y", Variant::I32(num(&rect["y"]) + num(&inner["y"]))),
+        ("client_w", Variant::I32(num(&inner["width"]))),
+        ("client_h", Variant::I32(num(&inner["height"]))),
         ("focused", n["focused"].as_bool().unwrap_or(false).into()),
         // The scratchpad is sway's nearest thing to minimizing.
         ("minimized", (ws_name == "__i3_scratch").into()),
@@ -560,16 +560,16 @@ async fn niri_windows(sock: &Path) -> Result<Vec<WindowDict>> {
             let ws = workspace(&w["workspace_id"]);
             let output = ws.and_then(|ws| ws["output"].as_str()).unwrap_or("");
             let mut fields = vec![
-                ("id", Value::U64(w["id"].as_u64().unwrap_or(0))),
+                ("id", Variant::U64(w["id"].as_u64().unwrap_or(0))),
                 ("title", w["title"].as_str().unwrap_or("").into()),
                 ("app_id", w["app_id"].as_str().unwrap_or("").into()),
                 ("wm_class", w["app_id"].as_str().unwrap_or("").into()),
-                ("pid", Value::I32(w["pid"].as_i64().unwrap_or(0) as i32)),
+                ("pid", Variant::I32(w["pid"].as_i64().unwrap_or(0) as i32)),
                 ("monitor", output.into()),
                 ("focused", w["is_focused"].as_bool().unwrap_or(false).into()),
                 (
                     "workspace",
-                    Value::I32(ws.and_then(|ws| ws["idx"].as_i64()).unwrap_or(0) as i32),
+                    Variant::I32(ws.and_then(|ws| ws["idx"].as_i64()).unwrap_or(0) as i32),
                 ),
                 (
                     "on_active_workspace",
@@ -593,14 +593,14 @@ async fn niri_windows(sock: &Path) -> Result<Vec<WindowDict>> {
                 let y = (f(&origin["y"]) + f(&tile[1]) + f(&offset[1])) as i32;
                 let (w, h) = (f(&size[0]) as i32, f(&size[1]) as i32);
                 fields.extend([
-                    ("frame_x", Value::I32(x)),
-                    ("frame_y", Value::I32(y)),
-                    ("frame_w", Value::I32(w)),
-                    ("frame_h", Value::I32(h)),
-                    ("client_x", Value::I32(x)),
-                    ("client_y", Value::I32(y)),
-                    ("client_w", Value::I32(w)),
-                    ("client_h", Value::I32(h)),
+                    ("frame_x", Variant::I32(x)),
+                    ("frame_y", Variant::I32(y)),
+                    ("frame_w", Variant::I32(w)),
+                    ("frame_h", Variant::I32(h)),
+                    ("client_x", Variant::I32(x)),
+                    ("client_y", Variant::I32(y)),
+                    ("client_w", Variant::I32(w)),
+                    ("client_h", Variant::I32(h)),
                 ]);
             }
             dict(fields)
@@ -703,11 +703,11 @@ fn hyprland_parse(clients: &str, monitors: &str, active: &str) -> Result<Vec<Win
             let (x, y) = (int(&c["at"][0]), int(&c["at"][1]));
             let (w, h) = (int(&c["size"][0]), int(&c["size"][1]));
             dict(vec![
-                ("id", Value::U64(id)),
+                ("id", Variant::U64(id)),
                 ("title", c["title"].as_str().unwrap_or("").into()),
                 ("app_id", class.into()),
                 ("wm_class", class.into()),
-                ("pid", Value::I32(int(&c["pid"]))),
+                ("pid", Variant::I32(int(&c["pid"]))),
                 (
                     "monitor",
                     monitor
@@ -716,14 +716,14 @@ fn hyprland_parse(clients: &str, monitors: &str, active: &str) -> Result<Vec<Win
                         .into(),
                 ),
                 ("is_x11", c["xwayland"].as_bool().unwrap_or(false).into()),
-                ("frame_x", Value::I32(x)),
-                ("frame_y", Value::I32(y)),
-                ("frame_w", Value::I32(w)),
-                ("frame_h", Value::I32(h)),
-                ("client_x", Value::I32(x)),
-                ("client_y", Value::I32(y)),
-                ("client_w", Value::I32(w)),
-                ("client_h", Value::I32(h)),
+                ("frame_x", Variant::I32(x)),
+                ("frame_y", Variant::I32(y)),
+                ("frame_w", Variant::I32(w)),
+                ("frame_h", Variant::I32(h)),
+                ("client_x", Variant::I32(x)),
+                ("client_y", Variant::I32(y)),
+                ("client_w", Variant::I32(w)),
+                ("client_h", Variant::I32(h)),
                 (
                     "focused",
                     (focused.is_some() && c["address"].as_str() == focused).into(),
@@ -755,21 +755,21 @@ pub(crate) fn window_matches(w: &WindowDict, pattern: &str) -> bool {
 }
 
 pub(crate) fn dict_i64(w: &WindowDict, key: &str) -> Result<i64> {
-    use zvariant::Value;
+    use zbus::Variant;
     let v = w
         .get(key)
         .ok_or_else(|| anyhow!("window dict missing {key:?}"))?;
     Ok(match &**v {
-        Value::U64(n) => *n as i64,
-        Value::U32(n) => *n as i64,
-        Value::I64(n) => *n,
-        Value::I32(n) => *n as i64,
+        Variant::U64(n) => *n as i64,
+        Variant::U32(n) => *n as i64,
+        Variant::I64(n) => *n,
+        Variant::I32(n) => *n as i64,
         other => return Err(anyhow!("window dict {key:?} is not an integer: {other:?}")),
     })
 }
 
 pub(crate) fn dict_bool(w: &WindowDict, key: &str) -> bool {
-    matches!(w.get(key).map(|v| &**v), Some(zvariant::Value::Bool(true)))
+    matches!(w.get(key).map(|v| &**v), Some(zbus::Variant::Bool(true)))
 }
 
 /// One line per window — enough for a caller to pick an id.
@@ -822,26 +822,29 @@ pub(crate) fn resolve_window_selector(windows: Vec<WindowDict>, sel: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zvariant::{OwnedValue, Value};
+    use zbus::{OwnedVariant, Variant};
 
     fn win(id: u64, wm_class: &str, title: &str, focused: bool) -> WindowDict {
         let mut w = WindowDict::new();
-        w.insert("id".into(), OwnedValue::try_from(Value::U64(id)).unwrap());
+        w.insert(
+            "id".into(),
+            OwnedVariant::try_from(Variant::U64(id)).unwrap(),
+        );
         w.insert(
             "wm_class".into(),
-            OwnedValue::try_from(Value::new(wm_class)).unwrap(),
+            OwnedVariant::try_from(Variant::new(wm_class)).unwrap(),
         );
         w.insert(
             "app_id".into(),
-            OwnedValue::try_from(Value::new("")).unwrap(),
+            OwnedVariant::try_from(Variant::new("")).unwrap(),
         );
         w.insert(
             "title".into(),
-            OwnedValue::try_from(Value::new(title)).unwrap(),
+            OwnedVariant::try_from(Variant::new(title)).unwrap(),
         );
         w.insert(
             "focused".into(),
-            OwnedValue::try_from(Value::Bool(focused)).unwrap(),
+            OwnedVariant::try_from(Variant::Bool(focused)).unwrap(),
         );
         w
     }

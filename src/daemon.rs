@@ -312,7 +312,7 @@ async fn session_survives(daemon: &Daemon) -> Result<bool> {
 /// without reading. Best-effort: no notification server, no
 /// notification.
 async fn notify_reconsent(bus: &zbus::Connection, summary: &str, body: &str) {
-    let hints = std::collections::HashMap::<&str, zvariant::Value>::new();
+    let hints = std::collections::HashMap::<&str, zbus::Variant>::new();
     let sent = bus
         .call_method(
             Some("org.freedesktop.Notifications"),
@@ -417,7 +417,7 @@ async fn screen_locked() -> bool {
     async fn locked() -> Result<bool> {
         let bus = zbus::Connection::system().await?;
         let dest = "org.freedesktop.login1";
-        let user: zvariant::OwnedObjectPath = bus
+        let user: zbus::OwnedObjectPath = bus
             .call_method(
                 Some(dest),
                 "/org/freedesktop/login1",
@@ -428,7 +428,7 @@ async fn screen_locked() -> bool {
             .await?
             .body()
             .deserialize()?;
-        let get = |path: zvariant::OwnedObjectPath, iface: &'static str, prop: &'static str| {
+        let get = |path: zbus::OwnedObjectPath, iface: &'static str, prop: &'static str| {
             let bus = bus.clone();
             async move {
                 let reply = bus
@@ -440,11 +440,11 @@ async fn screen_locked() -> bool {
                         &(iface, prop),
                     )
                     .await?;
-                let value: zvariant::OwnedValue = reply.body().deserialize()?;
+                let value: zbus::OwnedVariant = reply.body().deserialize()?;
                 Ok::<_, anyhow::Error>(value)
             }
         };
-        let (_id, display): (String, zvariant::OwnedObjectPath) =
+        let (_id, display): (String, zbus::OwnedObjectPath) =
             get(user, "org.freedesktop.login1.User", "Display")
                 .await?
                 .try_into()?;
@@ -1152,10 +1152,10 @@ impl Service {
     /// logical coordinates, and scale.
     async fn monitors(&self) -> Result<Vec<WindowDict>, Error> {
         let _call = self.admit()?;
-        let dict = |entries: Vec<(&str, zvariant::Value)>| -> Result<WindowDict, Error> {
+        let dict = |entries: Vec<(&str, zbus::Variant)>| -> Result<WindowDict, Error> {
             entries
                 .into_iter()
-                .map(|(k, v)| Ok((k.to_owned(), v.try_to_owned().map_err(zbus::Error::from)?)))
+                .map(|(k, v)| Ok((k.to_owned(), v.try_to_owned()?)))
                 .collect()
         };
         self.daemon
@@ -1338,10 +1338,11 @@ pub(crate) async fn serve_client<I: zbus::object_server::Interface>(
     make_iface: impl FnOnce(Hangup) -> I,
 ) -> Result<()> {
     let (hung_up, hangup) = watch::channel(false);
+    let stream = stream.into_std().context("the client's socket")?;
     let handshake = zbus::connection::Builder::unix_stream(stream)
-        .server(zbus::Guid::generate())?
+        .server(zbus::Guid::generate())
         .p2p()
-        .serve_at(crate::protocol::OBJECT_PATH, make_iface(Hangup(hangup)))?
+        .serve_at(crate::protocol::OBJECT_PATH, make_iface(Hangup(hangup)))
         .build();
     let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
@@ -1417,7 +1418,7 @@ mod tests {
             tx.send(hangup).ok().unwrap();
             Nothing
         }));
-        let conn = zbus::connection::Builder::unix_stream(client)
+        let conn = zbus::connection::Builder::unix_stream(client.into_std().unwrap())
             .p2p()
             .build()
             .await
