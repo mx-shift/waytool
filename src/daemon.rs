@@ -672,13 +672,15 @@ const TEXT_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// string that can't be typed types nothing.
 ///
 /// Through the extension, key presses from the keyboard device and
-/// commits don't arrive in the order they're sent: gnome-shell hands each key press to the input
-/// method's engine (IBus) and delivers it when the engine answers, while
-/// a commit is queued at once. So a string that needs a commit goes
-/// entirely through the extension — printable characters committed,
-/// control characters (Return, Tab, ...) forwarded as keys — which keeps
-/// one queue and one order. Keys still waiting on the engine from an
-/// earlier request can still land after it.
+/// commits don't arrive in the order they're sent: gnome-shell hands each
+/// key press to the input method's engine (IBus) and delivers it when the
+/// engine answers, while a commit is queued at once. So a string that
+/// needs a commit goes entirely through the extension — printable
+/// characters committed, control characters (Return, Tab, ...) forwarded
+/// as keys — which keeps one queue and one order. Key presses from
+/// earlier requests still with the engine would land in the middle of it
+/// (and commits made meanwhile can be lost), so it first waits for those
+/// to arrive (`Backend::keys_settled_at`).
 async fn type_text(
     portal: &Backend,
     extension: Option<&zbus::Connection>,
@@ -749,6 +751,9 @@ async fn type_text(
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if let Some(at) = portal.keys_settled_at() {
+            tokio::time::sleep_until(at.into()).await;
         }
     }
     for stroke in strokes {

@@ -26,6 +26,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use reis::ei;
@@ -36,6 +37,14 @@ use crate::keymap::{Events, Keys, Layout, canonical, check_code};
 /// How long to wait after connecting for the compositor to offer and
 /// resume the devices.
 const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long each key event sent adds to the backlog the compositor may
+/// still be delivering (see `Eis::keys_settled_at`).
+const KEY_EVENT_DRAIN: Duration = Duration::from_micros(250);
+
+/// How long the last key event may take to arrive once it's out of the
+/// backlog.
+const KEY_SETTLE: Duration = Duration::from_millis(50);
 
 /// How long a flush waits for the compositor to make room on the socket.
 const FLUSH_TIMEOUT_MS: i32 = 5000;
@@ -129,6 +138,9 @@ struct State {
     locked: u32,
     /// Buttons we hold down.
     held_buttons: HashSet<u32>,
+    /// When the key events sent so far should have reached the focused
+    /// window (see `Eis::keys_settled_at`).
+    keys_drained: Option<Instant>,
     disconnected: Option<String>,
 }
 
@@ -372,6 +384,7 @@ impl Eis {
             return Ok(());
         }
         let keep = !st.keys.is_empty();
+        let sent = events.len() as u32;
         self.emit::<ei::Keyboard>(st, Which::Keyboard, keep, |keyboard| {
             for (code, press) in events {
                 let state = if press {
@@ -381,7 +394,30 @@ impl Eis {
                 };
                 keyboard.key(code, state);
             }
-        })
+        })?;
+        let now = Instant::now();
+        let from = st.keys_drained.map_or(now, |t| t.max(now));
+        st.keys_drained = Some(from + KEY_EVENT_DRAIN * sent);
+        Ok(())
+    }
+
+    /// When the key events sent so far should have reached the focused
+    /// window, or None if none were sent.
+    ///
+    /// Deviation, with no spec to go by: GNOME doesn't deliver a key event
+    /// when it gets it. gnome-shell's input method hands each one to the
+    /// IBus engine and delivers it when the engine answers
+    /// (`vfunc_filter_key_event` in `js/misc/inputMethod.js`), so keys sent
+    /// in a burst trail the send by a backlog that grows with the burst:
+    /// about 0.1 ms an event on top of a few tens of ms, measured on GNOME
+    /// 50. Nothing reports when the backlog is gone, so this estimates it
+    /// with margin.
+    pub(crate) fn keys_settled_at(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap()
+            .keys_drained
+            .map(|t| t + KEY_SETTLE)
     }
 
     /// Whether the compositor takes text (libei's ei_text), which types

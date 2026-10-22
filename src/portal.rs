@@ -130,6 +130,12 @@ impl Portal {
         self.eis.keysym(keysym, press)
     }
 
+    /// When the key events sent so far should have reached the focused
+    /// window (see `Eis::keys_settled_at`).
+    pub(crate) fn keys_settled_at(&self) -> Option<std::time::Instant> {
+        self.eis.keys_settled_at()
+    }
+
     /// Press and release a Linux evdev keycode.
     pub(crate) fn tap_keycode(&self, code: u32) -> Result<()> {
         self.eis.keycode(code, true)?;

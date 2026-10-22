@@ -175,6 +175,16 @@ impl Backend {
         }
     }
 
+    /// When the key events sent so far should have reached the focused
+    /// window. Only the portal backend tracks it: it's for GNOME, whose
+    /// input method delays key events (see `Eis::keys_settled_at`).
+    pub(crate) fn keys_settled_at(&self) -> Option<std::time::Instant> {
+        match self {
+            Backend::Portal(p) => p.keys_settled_at(),
+            Backend::Native(_) => None,
+        }
+    }
+
     pub(crate) fn tap_keysym(&self, keysym: u32) -> Result<()> {
         self.keysym(keysym, true)?;
         self.keysym(keysym, false)
