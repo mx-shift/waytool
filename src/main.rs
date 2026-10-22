@@ -40,6 +40,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
+    version,
     about = "Keyboard and pointer input, screenshots and window control on Wayland.",
     long_about = "Keyboard and pointer input, screenshots and window control on Wayland.\n\
                   \n\
