@@ -87,7 +87,19 @@ export const AgentService = GObject.registerClass({
         // The user manager only emits PropertiesChanged for clients that
         // have subscribed.  Deliberately never Unsubscribe: the flag is
         // per bus connection, and gnome-shell's connection is shared.
-        await this._managerCall('Subscribe', null);
+        //
+        // Deviation: org.freedesktop.systemd1(5) doesn't say so, but a
+        // second Subscribe on the same connection fails with
+        // AlreadySubscribed (method_subscribe in systemd's
+        // src/core/dbus-manager.c).  gnome-shell re-enables extensions
+        // after every unlock, so that's the usual case here, and the
+        // subscription it reports is the one we want.
+        try {
+            await this._managerCall('Subscribe', null);
+        } catch (e) {
+            if (Gio.DBusError.get_remote_error(e) !== 'org.freedesktop.systemd1.AlreadySubscribed')
+                throw e;
+        }
 
         // A unit's object path is derived from its name and is stable
         // even while systemd has it unloaded, so subscribe by path once.
