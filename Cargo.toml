@@ -1,6 +1,6 @@
 [package]
 name = "waytool"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Command-line automation for Wayland: keyboard and pointer input, screenshots and window control on GNOME, KDE, wlroots compositors, Hyprland and niri"
