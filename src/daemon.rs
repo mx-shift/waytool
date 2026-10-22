@@ -455,7 +455,12 @@ impl Drop for SocketFile {
 /// timed out before the daemon got to it.
 fn gave_up_waiting(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        // zbus reports the socket's errors wrapped in its own.
+        let io = match cause.downcast_ref::<zbus::Error>() {
+            Some(zbus::Error::InputOutput(io)) => Some(&**io),
+            _ => cause.downcast_ref::<std::io::Error>(),
+        };
+        io.is_some_and(|io| {
             matches!(
                 io.kind(),
                 std::io::ErrorKind::BrokenPipe
@@ -1283,6 +1288,21 @@ pub(crate) async fn serve_client<I: zbus::object_server::Interface>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gave_up_waiting_sees_through_zbus() {
+        let hung_up = |kind: std::io::ErrorKind| {
+            anyhow::Error::from(zbus::Error::InputOutput(Arc::new(kind.into())))
+                .context("D-Bus handshake")
+        };
+        assert!(gave_up_waiting(&hung_up(std::io::ErrorKind::BrokenPipe)));
+        assert!(gave_up_waiting(&anyhow::Error::from(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+        assert!(!gave_up_waiting(&hung_up(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
 
     /// Live: what logind says about this session's lock.
     /// `cargo test -- --ignored screen_locked_live --nocapture`
