@@ -96,9 +96,9 @@ target/release/waytool tray &
   `click-in`, `move-global` and `click-global` use global logical coordinates. On a scaled
   monitor they differ by the scale.
 - Input is refused while logind says the screen is locked. GNOME ends the session when the
-  screen locks, which stops the daemon; start it again after unlocking. A display change that
-  moves, rescales, adds or removes a monitor needs a new session too, which the daemon sets up
-  with a new consent dialog. Lockers that don't set LockedHint (swaylock) aren't detected.
+  screen locks; the daemon sets it up again after unlocking, with a new consent dialog. A
+  display change that moves, rescales, adds or removes a monitor does the same. Lockers that
+  don't set LockedHint (swaylock) aren't detected.
 - On GNOME, text the layout lacks goes through gnome-shell's input method: GTK, Qt 6 and
   Firefox take it; X11 apps, emulators and Chromium without `--enable-wayland-ime` don't.
 - For emulators that drop fast typing, `--delay MS` waits after each character (25 suits
