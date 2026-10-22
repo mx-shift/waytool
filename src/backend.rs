@@ -125,7 +125,7 @@ async fn remote_desktop_version(bus: &zbus::Connection) -> Result<u32> {
         )
         .await
         .context("read the RemoteDesktop portal's version")?;
-    let value: zvariant::OwnedValue = reply.body().deserialize()?;
+    let value: zbus::OwnedVariant = reply.body().deserialize()?;
     Ok(u32::try_from(value)?)
 }
 

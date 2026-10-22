@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use zbus::OwnedObjectPath;
 use zbus::object_server::SignalEmitter;
-use zvariant::OwnedObjectPath;
 
 const UNIT: &str = "waytool.service";
 const ITEM_PATH: &str = "/StatusNotifierItem";
@@ -210,8 +210,8 @@ pub(crate) async fn run_tray() -> Result<()> {
 
     // Follow the unit.
     let props = zbus::fdo::PropertiesProxy::builder(&systemd)
-        .destination(SYSTEMD)?
-        .path(unit.clone())?
+        .destination(SYSTEMD)
+        .path(unit.clone())
         .build()
         .await?;
     let mut changes = props.receive_properties_changed().await?;
@@ -288,7 +288,7 @@ async fn read_state(systemd: &zbus::Connection, unit: &OwnedObjectPath) -> Unit 
             )
             .await
             .ok()?;
-        let value: zvariant::OwnedValue = reply.body().deserialize().ok()?;
+        let value: zbus::OwnedVariant = reply.body().deserialize().ok()?;
         String::try_from(value).ok()
     };
     let load = get("LoadState").await.unwrap_or_default();

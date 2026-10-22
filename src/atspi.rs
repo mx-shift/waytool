@@ -29,7 +29,7 @@ const UI_DEFAULT_DEPTH: u32 = 40;
 #[derive(Clone, Debug)]
 struct AccRef {
     dest: String,
-    path: zvariant::OwnedObjectPath,
+    path: zbus::OwnedObjectPath,
 }
 
 /// Connect to the dedicated accessibility bus (its address comes from
@@ -46,7 +46,7 @@ pub(crate) async fn a11y_connection(session: &zbus::Connection) -> Result<zbus::
         .await
         .context("org.a11y.Bus.GetAddress — is the accessibility stack running?")?;
     let addr: String = reply.body().deserialize()?;
-    zbus::connection::Builder::address(addr.as_str())?
+    zbus::connection::Builder::address(addr.as_str())
         .build()
         .await
         .with_context(|| format!("connect to accessibility bus at {addr}"))
@@ -62,7 +62,7 @@ async fn acc_children(conn: &zbus::Connection, r: &AccRef) -> Result<Vec<AccRef>
             &(),
         )
         .await?;
-    let kids: Vec<(String, zvariant::OwnedObjectPath)> = reply.body().deserialize()?;
+    let kids: Vec<(String, zbus::OwnedObjectPath)> = reply.body().deserialize()?;
     Ok(kids
         .into_iter()
         .filter(|(_, p)| p.as_str() != "/org/a11y/atspi/null")
@@ -83,7 +83,7 @@ async fn acc_name(conn: &zbus::Connection, r: &AccRef) -> String {
     match reply {
         Ok(m) => m
             .body()
-            .deserialize::<zvariant::OwnedValue>()
+            .deserialize::<zbus::OwnedVariant>()
             .ok()
             .and_then(|v| String::try_from(v).ok())
             .unwrap_or_default(),
@@ -180,7 +180,7 @@ async fn a11y_app_pid(conn: &zbus::Connection, dest: &str) -> Option<u32> {
 async fn a11y_find_apps(conn: &zbus::Connection, win: &WindowDict) -> Result<(Vec<AccRef>, bool)> {
     let root = AccRef {
         dest: ATSPI_ROOT_DEST.into(),
-        path: zvariant::OwnedObjectPath::try_from(ATSPI_ROOT_PATH)?,
+        path: zbus::OwnedObjectPath::try_from(ATSPI_ROOT_PATH)?,
     };
     let apps = acc_children(conn, &root)
         .await

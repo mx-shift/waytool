@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 const DEST: &str = "org.gnome.Mutter.DisplayConfig";
 const PATH: &str = "/org/gnome/Mutter/DisplayConfig";
@@ -25,9 +25,9 @@ type CurrentState = (
             f64,
             f64,
             Vec<f64>,
-            HashMap<String, OwnedValue>,
+            HashMap<String, OwnedVariant>,
         )>,
-        HashMap<String, OwnedValue>,
+        HashMap<String, OwnedVariant>,
     )>,
     Vec<(
         i32,
@@ -36,9 +36,9 @@ type CurrentState = (
         u32,
         bool,
         Vec<(String, String, String, String)>,
-        HashMap<String, OwnedValue>,
+        HashMap<String, OwnedVariant>,
     )>,
-    HashMap<String, OwnedValue>,
+    HashMap<String, OwnedVariant>,
 );
 
 /// Whether GNOME lays monitors out in physical pixels ("layout-mode"

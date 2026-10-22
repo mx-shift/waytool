@@ -2139,7 +2139,6 @@ dependencies = [
  "wayland-protocols-wlr",
  "xkbcommon",
  "zbus 6.0.0",
- "zvariant",
 ]
 
 [[package]]

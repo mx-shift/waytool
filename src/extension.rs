@@ -32,8 +32,8 @@ const EXT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// installer rather than being a bare UnknownObject.
 pub(crate) async fn ext_call<B, R>(proxy: &zbus::Proxy<'_>, method: &str, body: &B) -> Result<R>
 where
-    B: serde::Serialize + zvariant::DynamicType,
-    R: for<'d> zvariant::DynamicDeserialize<'d>,
+    B: serde::Serialize + zbus::DynamicType,
+    R: for<'d> zbus::wire::DynamicDeserialize<'d>,
 {
     // gnome-shell runs these on its main thread; one that never answers
     // mustn't hang the request (and the input lock it may hold).
@@ -45,8 +45,8 @@ where
                 EXT_CALL_TIMEOUT.as_secs()
             )
         })?;
-    call.map_err(|e| match e {
-        zbus::Error::MethodError(name, _, _)
+    call.map_err(|e| match crate::protocol::error_reply(&e) {
+        Some((name, _))
             if [
                 "org.freedesktop.DBus.Error.ServiceUnknown",
                 "org.freedesktop.DBus.Error.UnknownObject",
@@ -57,8 +57,8 @@ where
         {
             anyhow!("{EXT_INTERFACE}.{method} isn't available ({name}). {EXT_NOT_FOUND_HINT}")
         }
-        zbus::Error::MethodError(_, Some(msg), _) => anyhow!("{method}: {msg}"),
-        e => anyhow!("{EXT_INTERFACE}.{method} failed: {e}"),
+        Some((_, Some(msg))) => anyhow!("{method}: {msg}"),
+        _ => anyhow!("{EXT_INTERFACE}.{method} failed: {e}"),
     })
 }
 

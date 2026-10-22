@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
-use zvariant::{DeserializeDict, SerializeDict, Type};
+use zbus::{DeserializeDict, SerializeDict, Type};
 
 /// The one object the daemon serves. Its interface is
 /// `com.mxshift.Waytool.Daemon1`, spelled out in the proxy below
@@ -61,7 +61,7 @@ impl From<anyhow::Error> for Error {
 /// One portal stream (a monitor). `position`/`size` are its rect in
 /// global logical coordinates, when the portal reported one.
 #[derive(Debug, SerializeDict, DeserializeDict, Type)]
-#[zvariant(signature = "dict")]
+#[zbus(signature = "dict")]
 pub struct StreamDesc {
     /// The PipeWire node, for a portal stream.
     pub node_id: Option<u32>,
@@ -75,7 +75,7 @@ pub struct StreamDesc {
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    pub rgba: zvariant::OwnedFd,
+    pub rgba: zbus::OwnedFd,
 }
 
 /// Elements of a window's accessibility (AT-SPI2) tree.
@@ -96,7 +96,7 @@ pub struct UiTree {
 /// elements without extents and for hidden ones, whose reported
 /// positions are meaningless.
 #[derive(Debug, SerializeDict, DeserializeDict, Type)]
-#[zvariant(signature = "dict")]
+#[zbus(signature = "dict")]
 pub struct UiNode {
     pub depth: u32,
     pub role: String,
@@ -108,28 +108,28 @@ pub struct UiNode {
 /// A window or monitor as the gnome-shell extension describes it,
 /// passed through unchanged: `a{sv}` with keys like `id`, `title`,
 /// `frame_x`, `scale`.
-pub type WindowDict = std::collections::HashMap<String, zvariant::OwnedValue>;
+pub type WindowDict = std::collections::HashMap<String, zbus::OwnedVariant>;
 
-/// Render a dict value as text. zvariant doesn't implement Display on
-/// OwnedValue/Value so this dispatches on the common scalar variants
+/// Render a dict value as text. zbus doesn't implement Display on
+/// OwnedVariant/Variant so this dispatches on the common scalar variants
 /// explicitly and falls back to Debug for the rest (arrays, dicts,
 /// structs).
-pub fn render_value(v: &zvariant::OwnedValue) -> String {
-    use zvariant::Value;
-    let inner: &Value = v;
+pub fn render_value(v: &zbus::OwnedVariant) -> String {
+    use zbus::Variant;
+    let inner: &Variant = v;
     match inner {
-        Value::Str(s) => s.to_string(),
-        Value::U64(n) => n.to_string(),
-        Value::U32(n) => n.to_string(),
-        Value::U16(n) => n.to_string(),
-        Value::U8(n) => n.to_string(),
-        Value::I64(n) => n.to_string(),
-        Value::I32(n) => n.to_string(),
-        Value::I16(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::F64(f) => format!("{f}"),
-        Value::Signature(s) => s.to_string(),
-        Value::ObjectPath(p) => p.to_string(),
+        Variant::Str(s) => s.to_string(),
+        Variant::U64(n) => n.to_string(),
+        Variant::U32(n) => n.to_string(),
+        Variant::U16(n) => n.to_string(),
+        Variant::U8(n) => n.to_string(),
+        Variant::I64(n) => n.to_string(),
+        Variant::I32(n) => n.to_string(),
+        Variant::I16(n) => n.to_string(),
+        Variant::Bool(b) => b.to_string(),
+        Variant::F64(f) => format!("{f}"),
+        Variant::Signature(s) => s.to_string(),
+        Variant::ObjectPath(p) => p.to_string(),
         _ => format!("{inner:?}"),
     }
 }
@@ -140,8 +140,7 @@ pub fn render_value(v: &zvariant::OwnedValue) -> String {
 #[zbus::proxy(
     interface = "com.mxshift.Waytool.Daemon1",
     default_service = "com.mxshift.Waytool.Daemon",
-    default_path = "/com/mxshift/Waytool/Daemon",
-    gen_blocking = false
+    default_path = "/com/mxshift/Waytool/Daemon"
 )]
 pub trait Daemon {
     /// Cheap liveness check.
@@ -239,6 +238,7 @@ pub async fn connect() -> Result<DaemonProxy<'static>> {
 }
 
 async fn connect_stream(stream: UnixStream) -> Result<DaemonProxy<'static>> {
+    let stream = stream.into_std().context("the daemon's socket")?;
     let handshake = zbus::connection::Builder::unix_stream(stream).p2p().build();
     let conn = tokio::time::timeout(std::time::Duration::from_secs(10), handshake)
         .await
@@ -247,26 +247,42 @@ async fn connect_stream(stream: UnixStream) -> Result<DaemonProxy<'static>> {
     DaemonProxy::new(&conn).await.context("daemon proxy")
 }
 
+/// The name and message of the D-Bus error a method call was answered
+/// with, if that's how it failed. zbus reports a name that `fdo::Error`
+/// defines (`UnknownMethod`, `ServiceUnknown`, ...) as `Error::FDO`, and
+/// any other as `Error::MethodError`.
+pub(crate) fn error_reply(e: &zbus::Error) -> Option<(String, Option<String>)> {
+    use zbus::DBusError;
+    match e {
+        zbus::Error::MethodError(name, message, _) => Some((name.to_string(), message.clone())),
+        zbus::Error::FDO(e) => Some((e.name().to_string(), e.description().map(str::to_owned))),
+        zbus::Error::DBus(e) => Some((e.name().to_string(), e.description().map(str::to_owned))),
+        _ => None,
+    }
+}
+
 /// Turn a failed method call into an error worth showing: the daemon's
 /// own message for `Failed`, and a hint for the mismatch you get when
 /// the running daemon is from a different release than the CLI.
 pub fn describe(e: Error) -> anyhow::Error {
     match e {
         Error::Failed(msg) => anyhow!(msg),
-        Error::ZBus(zbus::Error::MethodError(name, _, _))
-            if [
-                "org.freedesktop.DBus.Error.UnknownMethod",
-                "org.freedesktop.DBus.Error.UnknownInterface",
-                "org.freedesktop.DBus.Error.UnknownObject",
-            ]
-            .contains(&name.as_str()) =>
-        {
-            anyhow!(
-                "the running daemon doesn't support this command ({name}); it's from \
-                 a different release than this CLI — restart it"
-            )
-        }
-        Error::ZBus(e) => anyhow!(e),
+        Error::ZBus(e) => match error_reply(&e) {
+            Some((name, _))
+                if [
+                    "org.freedesktop.DBus.Error.UnknownMethod",
+                    "org.freedesktop.DBus.Error.UnknownInterface",
+                    "org.freedesktop.DBus.Error.UnknownObject",
+                ]
+                .contains(&name.as_str()) =>
+            {
+                anyhow!(
+                    "the running daemon doesn't support this command ({name}); it's from \
+                     a different release than this CLI — restart it"
+                )
+            }
+            _ => anyhow!(e),
+        },
     }
 }
 
