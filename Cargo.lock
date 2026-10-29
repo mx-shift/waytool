@@ -1730,7 +1730,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -2120,7 +2120,7 @@ dependencies = [
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "xkbcommon",
- "zbus 6.0.0",
+ "zbus 6.2.0",
 ]
 
 [[package]]
@@ -2213,9 +2213,9 @@ dependencies = [
 
 [[package]]
 name = "zbus"
-version = "6.0.0"
+version = "6.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "266223222c9d81e5966455a9da0783e35d56a7ccab79a03c2366b2d98f8fc8a9"
+checksum = "3666b126b788c05de810dd9e4e8dc84b21f87f7ad70a29a09b9db093f0102891"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -2233,7 +2233,7 @@ dependencies = [
  "uuid",
  "windows-sys",
  "winnow",
- "zbus_macros 6.0.0",
+ "zbus_macros 6.2.0",
  "zbus_utils",
  "zcheapstr",
  "zruntime",
@@ -2256,9 +2256,9 @@ dependencies = [
 
 [[package]]
 name = "zbus_macros"
-version = "6.0.0"
+version = "6.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69191782481ef4e0ac88ca487347c52e08bb85cceb2a163b79f7281fe5be0a3c"
+checksum = "20e0bfa90f7877d308d09bdac3586a45c5f5986e58ebf6ec5c3b809c21ad8e22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2279,9 +2279,9 @@ dependencies = [
 
 [[package]]
 name = "zbus_utils"
-version = "6.0.0"
+version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c27a055b114bd9fc3686e90f62bd1fe612d523fc5f620bac3b1d2f42d3f6cab8"
+checksum = "af55e52da295311b368c45bcae221f020e28e97a2420360170ce389218e76ec7"
 dependencies = [
  "proc-macro2",
  "quote",
