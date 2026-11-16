@@ -25,7 +25,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 # GPL-3.0-only to MIT after its last crates.io release (0.2.0, still
 # GPL). This crate can't be published to crates.io while it depends on
 # git, so it stays blocked until an MIT release exists to switch to.
-cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "c0cff4db14c37ed954983158e4055aa94c7741d9", default-features = false, features = ["client"] }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "815b2c5df84a4a82eb8fb505343f8ebde6aefc38", default-features = false, features = ["client"] }
 wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "staging"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
